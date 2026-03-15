@@ -1,0 +1,62 @@
+# docker-compose.yml
+version: '3.9'
+
+services:
+  # Signaling server (Socket.IO)
+  signal:
+    build:
+      context: .
+      dockerfile: Dockerfile.signal
+    ports:
+      - "3001:3001"
+    environment:
+      - SIGNAL_PORT=3001
+      - NODE_ENV=production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Next.js web app
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_SIGNAL_SERVER=http://signal:3001
+    depends_on:
+      - signal
+    restart: unless-stopped
+
+  # COTURN server for NAT traversal
+  coturn:
+    image: coturn/coturn:latest
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "5349:5349/udp"
+      - "5349:5349/tcp"
+      - "49152-65535:49152-65535/udp"
+    volumes:
+      - ./coturn/turnserver.conf:/etc/turnserver.conf:ro
+    command: -c /etc/turnserver.conf
+    restart: unless-stopped
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - app
+      - signal
+    restart: unless-stopped
