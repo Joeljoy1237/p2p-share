@@ -11,30 +11,31 @@
     "server": "node server/signaling-server.js"
   },
   "dependencies": {
+    "@tailwindcss/postcss": "^4.2.1",
+    "clsx": "^2.1.1",
+    "framer-motion": "^12.36.0",
+    "lucide-react": "^0.577.0",
     "next": "16.1.6",
+    "qrcode": "^1.5.4",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
-    "ws": "^8.19.0",
-    "uuid": "^13.0.0",
     "simple-peer": "^9.11.1",
     "socket.io": "^4.8.3",
     "socket.io-client": "^4.8.3",
-    "qrcode": "^1.5.4",
-    "framer-motion": "^12.36.0",
-    "lucide-react": "^0.577.0",
-    "clsx": "^2.1.1"
+    "uuid": "^13.0.0",
+    "ws": "^8.19.0"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@types/uuid": "^11.0.0",
-    "@types/qrcode": "^1.5.6",
-    "typescript": "^5.9.3",
-    "tailwindcss": "^4.2.1",
-    "postcss": "^8.5.8",
     "autoprefixer": "^10.4.27",
     "eslint": "^10.0.3",
-    "eslint-config-next": "16.1.6"
+    "eslint-config-next": "16.1.6",
+    "postcss": "^8.5.8",
+    "tailwindcss": "^4.2.1",
+    "typescript": "^5.9.3"
   }
 }

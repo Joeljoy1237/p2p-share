@@ -253,18 +253,44 @@ export class P2PConnection {
   }
 
   async handleOffer(offer: RTCSessionDescriptionInit): Promise<RTCSessionDescriptionInit> {
-    await this.pc.setRemoteDescription(offer);
-    const answer = await this.pc.createAnswer();
-    await this.pc.setLocalDescription(answer);
-    return answer;
+    try {
+      if (this.pc.signalingState !== 'stable') {
+        await this.pc.setRemoteDescription({ type: 'rollback' } as RTCSessionDescriptionInit).catch(() => {});
+      }
+      await this.pc.setRemoteDescription(offer);
+      const answer = await this.pc.createAnswer();
+      await this.pc.setLocalDescription(answer);
+      return answer;
+    } catch (err) {
+      console.error('Error handling offer:', err);
+      throw err;
+    }
   }
 
   async handleAnswer(answer: RTCSessionDescriptionInit) {
-    await this.pc.setRemoteDescription(answer);
+    try {
+      if (this.pc.signalingState !== 'have-local-offer') {
+        console.warn(`Skipping handleAnswer: state is ${this.pc.signalingState}, expected have-local-offer`);
+        return;
+      }
+      await this.pc.setRemoteDescription(answer);
+    } catch (err) {
+      console.error('Error handling answer:', err);
+    }
   }
 
   async addIceCandidate(candidate: RTCIceCandidateInit) {
-    await this.pc.addIceCandidate(candidate);
+    try {
+      if (!this.pc.remoteDescription) {
+        // Queue candidate or wait? For now, we'll just ignore if no remote description yet.
+        // Usually, candidates arrive after offer/answer.
+        console.warn('Skipping ICE candidate: no remote description yet');
+        return;
+      }
+      await this.pc.addIceCandidate(candidate);
+    } catch (err) {
+      console.error('Error adding ICE candidate:', err);
+    }
   }
 
   sendFiles(files: File[]) {

@@ -32,8 +32,12 @@ export interface UseSignalingReturn {
   error: string | null;
 }
 
+// lib/use-signaling.ts
+declare global {
+  var __signaling_socket: Socket | undefined;
+}
+
 export function useSignaling(): UseSignalingReturn {
-  const socketRef = useRef<Socket | null>(null);
   const connectionsRef = useRef<Map<string, P2PConnection>>(new Map());
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [room, setRoom] = useState<Room | null>(null);
@@ -48,7 +52,7 @@ export function useSignaling(): UseSignalingReturn {
       return connectionsRef.current.get(peerId)!;
     }
 
-    const conn = new P2PConnection(DEFAULT_RTC_CONFIG, socketRef.current?.id || '', peerId);
+    const conn = new P2PConnection(DEFAULT_RTC_CONFIG, globalThis.__signaling_socket?.id || '', peerId);
 
     conn.on('connected', () => {
       setConnectedPeers((prev) => [...new Set([...prev, peerId])]);
@@ -58,7 +62,7 @@ export function useSignaling(): UseSignalingReturn {
     conn.on('disconnected', () => {
       connectionsRef.current.delete(peerId);
       setConnectedPeers((prev) => prev.filter((id) => id !== peerId));
-      if (connectionsRef.current.size === 0) setStatus('connected'); // still in room
+      if (connectionsRef.current.size === 0) setStatus('connected');
     });
 
     conn.on('progress', (data) => {
@@ -66,19 +70,19 @@ export function useSignaling(): UseSignalingReturn {
       setTransfers((prev) => {
         const next = new Map(prev);
         next.set(progress.fileId, progress);
+        if (progress.status === 'completed') {
+          setTimeout(() => {
+            setTransfers((prevNext) => {
+              const newerNext = new Map(prevNext);
+              newerNext.delete(progress.fileId);
+              if (newerNext.size === 0) setStatus('connected');
+              return newerNext;
+            });
+          }, 2000);
+        }
         return next;
       });
       setStatus('transferring');
-      if (progress.status === 'completed') {
-        setTimeout(() => {
-          setTransfers((prev) => {
-            const next = new Map(prev);
-            next.delete(progress.fileId);
-            return next;
-          });
-          if (transfers.size <= 1) setStatus('connected');
-        }, 2000);
-      }
     });
 
     conn.on('file-received', (data) => {
@@ -95,7 +99,7 @@ export function useSignaling(): UseSignalingReturn {
     });
 
     conn.on('ice-candidate', (data) => {
-      socketRef.current?.emit('signal', {
+      globalThis.__signaling_socket?.emit('signal', {
         targetPeerId: peerId,
         signal: { type: 'ice-candidate', candidate: (data as { candidate: RTCIceCandidate }).candidate },
       });
@@ -109,7 +113,7 @@ export function useSignaling(): UseSignalingReturn {
 
     if (isInitiator) {
       conn.createOffer().then((offer) => {
-        socketRef.current?.emit('signal', {
+        globalThis.__signaling_socket?.emit('signal', {
           targetPeerId: peerId,
           signal: { type: 'offer', sdp: offer },
         });
@@ -117,46 +121,50 @@ export function useSignaling(): UseSignalingReturn {
     }
 
     return conn;
-  }, [transfers]);
+  }, []);
 
   useEffect(() => {
-    const socket = io(SIGNAL_SERVER, {
-      transports: ['websocket', 'polling'],
-      reconnectionAttempts: 5,
-      reconnectionDelay: 1000,
-    });
+    if (typeof window === 'undefined') return;
 
-    socketRef.current = socket;
+    if (!globalThis.__signaling_socket) {
+      globalThis.__signaling_socket = io(SIGNAL_SERVER, {
+        transports: ['websocket', 'polling'],
+        reconnectionAttempts: 10,
+        reconnectionDelay: 1000,
+        autoConnect: true,
+      });
+    }
 
-    socket.on('connect', () => {
-      setMyPeerId(socket.id);
+    const s = globalThis.__signaling_socket;
+
+    const onConnect = () => {
+      setMyPeerId(s.id || '');
       setError(null);
-    });
+    };
 
-    socket.on('connect_error', (err) => {
+    const onConnectError = (err: Error) => {
       setError(`Cannot connect to signaling server: ${err.message}`);
       setStatus('error');
-    });
+    };
 
-    socket.on('peer-joined', ({ peerId }: { peerId: string; peerCount: number }) => {
-      // We're already in the room, initiate connection to the new peer
+    const onPeerJoined = ({ peerId }: { peerId: string }) => {
       getOrCreateConnection(peerId, true);
-    });
+    };
 
-    socket.on('peer-left', ({ peerId }: { peerId: string }) => {
+    const onPeerLeft = ({ peerId }: { peerId: string }) => {
       const conn = connectionsRef.current.get(peerId);
       if (conn) {
         conn.close();
         connectionsRef.current.delete(peerId);
       }
       setConnectedPeers((prev) => prev.filter((id) => id !== peerId));
-    });
+    };
 
-    socket.on('signal', async ({ peerId, signal }: { peerId: string; signal: { type: string; sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit } }) => {
+    const onSignal = async ({ peerId, signal }: any) => {
       if (signal.type === 'offer') {
         const conn = getOrCreateConnection(peerId, false);
         const answer = await conn.handleOffer(signal.sdp!);
-        socket.emit('signal', {
+        s.emit('signal', {
           targetPeerId: peerId,
           signal: { type: 'answer', sdp: answer },
         });
@@ -167,18 +175,33 @@ export function useSignaling(): UseSignalingReturn {
         const conn = connectionsRef.current.get(peerId);
         if (conn && signal.candidate) await conn.addIceCandidate(signal.candidate);
       }
-    });
+    };
 
-    socket.on('room-expired', () => {
+    const onRoomExpired = () => {
       setError('Room has expired');
       setRoom(null);
       setStatus('disconnected');
-    });
+    };
+
+    if (s.connected) onConnect();
+
+    s.on('connect', onConnect);
+    s.on('connect_error', onConnectError);
+    s.on('peer-joined', onPeerJoined);
+    s.on('peer-left', onPeerLeft);
+    s.on('signal', onSignal);
+    s.on('room-expired', onRoomExpired);
 
     return () => {
+      s.off('connect', onConnect);
+      s.off('connect_error', onConnectError);
+      s.off('peer-joined', onPeerJoined);
+      s.off('peer-left', onPeerLeft);
+      s.off('signal', onSignal);
+      s.off('room-expired', onRoomExpired);
+      
       connectionsRef.current.forEach((conn) => conn.close());
       connectionsRef.current.clear();
-      socket.disconnect();
     };
   }, [getOrCreateConnection]);
 
@@ -186,7 +209,7 @@ export function useSignaling(): UseSignalingReturn {
     (options?: { maxPeers?: number; password?: string }): Promise<Room> => {
       return new Promise((resolve, reject) => {
         setStatus('connecting');
-        socketRef.current?.emit('create-room', options || {}, (response: { success: boolean; room: Room; error?: string }) => {
+        globalThis.__signaling_socket?.emit('create-room', options || {}, (response: { success: boolean; room: Room; error?: string }) => {
           if (response.success) {
             setRoom(response.room);
             setStatus('connected');
@@ -206,7 +229,7 @@ export function useSignaling(): UseSignalingReturn {
     (roomIdOrCode: string, password?: string): Promise<void> => {
       return new Promise((resolve, reject) => {
         setStatus('connecting');
-        socketRef.current?.emit(
+        globalThis.__signaling_socket?.emit(
           'join-room',
           { roomIdOrCode: roomIdOrCode.toUpperCase().trim(), password },
           (response: { success: boolean; room: Room; existingPeers: string[]; error?: string }) => {
@@ -237,7 +260,7 @@ export function useSignaling(): UseSignalingReturn {
     setTransfers(new Map());
     setRoom(null);
     setStatus('disconnected');
-    socketRef.current?.emit('leave-room');
+    globalThis.__signaling_socket?.emit('leave-room');
   }, []);
 
   const sendFiles = useCallback((files: File[]) => {
@@ -245,7 +268,7 @@ export function useSignaling(): UseSignalingReturn {
       conn.sendFiles(files);
     });
     setStatus('transferring');
-    socketRef.current?.emit('transfer-start', {
+    globalThis.__signaling_socket?.emit('transfer-start', {
       files: files.map((f) => ({
         name: f.name,
         size: f.size,
