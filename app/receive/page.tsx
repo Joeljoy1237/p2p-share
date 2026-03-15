@@ -1,6 +1,6 @@
 // app/receive/page.tsx
 'use client';
-import { useState, useEffect, Suspense } from 'react';
+import { useState, useEffect, Suspense, useCallback, useMemo, useRef } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { useSignaling } from '@/lib/use-signaling';
@@ -16,6 +16,133 @@ function ReceiveContent() {
   const [isJoining, setIsJoining] = useState(false);
   const [autoJoined, setAutoJoined] = useState(false);
 
+  const [directSave, setDirectSave] = useState(false);
+  const [isFileSystemSupported, setIsFileSystemSupported] = useState(false);
+  const [isScanning, setIsScanning] = useState(false);
+  const [rootDirectory, setRootDirectory] = useState<any>(null);
+  const [pendingStreams, setPendingStreams] = useState<Map<string, { peerId: string; metadata: any }>>(new Map());
+
+  // Use refs for signaling functions to avoid circular dependency in useCallback
+  const signalingRefs = useRef<{ setFileStream: any, pauseTransfer: any, resumeTransfer: any }>({
+    setFileStream: () => {},
+    pauseTransfer: () => {},
+    resumeTransfer: () => {},
+  });
+
+  // Filename resolution helper
+  const getUniqueFileHandle = async (dirHandle: any, name: string) => {
+    let finalName = name;
+    let counter = 1;
+    const dotIndex = name.lastIndexOf('.');
+    const base = dotIndex === -1 ? name : name.substring(0, dotIndex);
+    const ext = dotIndex === -1 ? '' : name.substring(dotIndex);
+
+    while (true) {
+      try {
+        await dirHandle.getFileHandle(finalName);
+        // If it doesn't throw, the file exists
+        finalName = `${base} (${counter})${ext}`;
+        counter++;
+      } catch (e) {
+        // If it throws, the file name is available
+        return await dirHandle.getFileHandle(finalName, { create: true });
+      }
+    }
+  };
+
+  useEffect(() => {
+    setIsFileSystemSupported('showSaveFilePicker' in window);
+  }, []);
+
+  // QR Scanner Logic
+  useEffect(() => {
+    if (!isScanning) return;
+
+    let scanner: any = null;
+
+    const startScanner = async () => {
+      const { Html5QrcodeScanner } = await import('html5-qrcode');
+      scanner = new Html5QrcodeScanner(
+        'qr-reader',
+        { fps: 10, qrbox: { width: 250, height: 250 } },
+        /* verbose= */ false
+      );
+
+      scanner.render((decodedText: string) => {
+        // Handle scanned URL or code
+        try {
+          const url = new URL(decodedText);
+          const room = url.searchParams.get('room');
+          if (room) {
+            setRoomCode(room);
+            setIsScanning(false);
+            scanner.clear();
+          }
+        } catch {
+          // If not a URL, assume it's just the code
+          setRoomCode(decodedText.trim().toUpperCase());
+          setIsScanning(false);
+          scanner.clear();
+        }
+      }, (error: any) => {
+        // silent error for frame scanning
+      });
+    };
+
+    startScanner();
+
+    return () => {
+      if (scanner) {
+        scanner.clear().catch(console.error);
+      }
+    };
+  }, [isScanning]);
+
+  const onFileStart = useCallback(async (peerId: string, fileId: string, metadata: any) => {
+    if (!directSave) return;
+    
+    // 1. Try to use the common directory if available
+    if (rootDirectory) {
+      try {
+        const fileHandle = await getUniqueFileHandle(rootDirectory, metadata.name);
+        const writable = await fileHandle.createWritable();
+        signalingRefs.current.setFileStream(peerId, fileId, writable);
+        return; // Success! No need to pause or ask
+      } catch (err) {
+        console.warn('Failed to auto-save to directory, falling back to manual:', err);
+      }
+    }
+
+    // 2. Fallback to manual 'Pause & Pick' if no directory or auto-save failed
+    setPendingStreams(prev => new Map(prev).set(fileId, { peerId, metadata }));
+    signalingRefs.current.pauseTransfer();
+  }, [directSave, rootDirectory]); // stable refs used inside
+
+  const handleToggleDirectSave = async (enabled: boolean) => {
+    if (!enabled) {
+      setDirectSave(false);
+      setRootDirectory(null);
+      return;
+    }
+
+    try {
+      // @ts-ignore
+      const handle = await window.showDirectoryPicker();
+      // Check permission
+      const permission = await handle.queryPermission({ mode: 'readwrite' });
+      if (permission !== 'granted') {
+        const request = await handle.requestPermission({ mode: 'readwrite' });
+        if (request !== 'granted') throw new Error('Permission denied');
+      }
+      
+      setRootDirectory(handle);
+      setDirectSave(true);
+    } catch (err) {
+      console.error('Directory selection failed:', err);
+      setDirectSave(false);
+    }
+  };
+
   const {
     status,
     room,
@@ -24,8 +151,51 @@ function ReceiveContent() {
     receivedFiles,
     joinRoom,
     leaveRoom,
+    setFileStream,
+    pauseTransfer,
+    resumeTransfer,
     error,
-  } = useSignaling();
+  } = useSignaling({ onFileStart });
+
+  // Update refs when signaling functions change
+  useEffect(() => {
+    signalingRefs.current = { setFileStream, pauseTransfer, resumeTransfer };
+  }, [setFileStream, pauseTransfer, resumeTransfer]);
+
+  const handleSetSaveLocation = async (fileId: string) => {
+    const pending = pendingStreams.get(fileId);
+    if (!pending) return;
+
+    try {
+      // @ts-ignore
+      const handle = await window.showSaveFilePicker({
+        suggestedName: pending.metadata.name,
+      });
+      const writable = await handle.createWritable();
+      
+      // Setup the stream in the P2P connection
+      setFileStream(pending.peerId, fileId, writable);
+      
+      // Cleanup pending state
+      setPendingStreams(prev => {
+        const next = new Map(prev);
+        next.delete(fileId);
+        return next;
+      });
+      
+      // Resume the transfer
+      resumeTransfer();
+    } catch (err) {
+      console.error('File save picker cancelled or failed:', err);
+      // Fallback: if user cancels, we can either stay paused or fallback to memory
+      setPendingStreams(prev => {
+        const next = new Map(prev);
+        next.delete(fileId);
+        return next;
+      });
+      resumeTransfer();
+    }
+  };
 
   const isInRoom = !!room;
 
@@ -47,6 +217,11 @@ function ReceiveContent() {
   };
 
   const downloadFile = (file: ReceivedFile) => {
+    if (file.streamed) {
+      alert('File was saved directly to your disk.');
+      return;
+    }
+    if (!file.url) return;
     const a = document.createElement('a');
     a.href = file.url;
     a.download = file.metadata.name;
@@ -55,7 +230,9 @@ function ReceiveContent() {
 
   const downloadAll = () => {
     receivedFiles.forEach((file) => {
-      setTimeout(() => downloadFile(file), 100);
+      if (!file.streamed) {
+        setTimeout(() => downloadFile(file), 100);
+      }
     });
   };
 
@@ -102,6 +279,32 @@ function ReceiveContent() {
       </header>
 
       <div style={{ maxWidth: 900, margin: '0 auto', padding: '40px 24px' }}>
+        
+        {/* Settings / Mode */}
+        {isInRoom && (
+          <div className="card animate-fade-in" style={{ padding: '16px 24px', marginBottom: 24, display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'var(--surface-2)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div style={{ fontSize: 20 }}>💾</div>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 600 }}>Direct Save to Disk</div>
+                <div style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                  {isFileSystemSupported 
+                    ? (rootDirectory ? `Saving to: ${rootDirectory.name}` : 'Bypasses browser memory limits for large files') 
+                    : 'Not supported in this browser'}
+                </div>
+              </div>
+            </div>
+            <label className="switch">
+              <input 
+                type="checkbox" 
+                checked={directSave} 
+                onChange={(e) => handleToggleDirectSave(e.target.checked)} 
+                disabled={!isFileSystemSupported}
+              />
+              <span className="slider" />
+            </label>
+          </div>
+        )}
 
         {/* Join Form */}
         {!isInRoom && (
@@ -115,6 +318,31 @@ function ReceiveContent() {
             </div>
 
             <form onSubmit={handleJoin}>
+              <div style={{ marginBottom: 24, textAlign: 'center' }}>
+                <button
+                  type="button"
+                  className={`btn ${isScanning ? 'btn-danger' : 'btn-ghost'}`}
+                  onClick={() => setIsScanning(!isScanning)}
+                  style={{ width: '100%', marginBottom: 16 }}
+                >
+                  {isScanning ? '✕ Cancel Scanning' : '📷 Scan QR Code'}
+                </button>
+
+                {isScanning && (
+                  <div 
+                    id="qr-reader" 
+                    className="card animate-fade-in" 
+                    style={{ 
+                      overflow: 'hidden', 
+                      background: 'black', 
+                      borderRadius: 16,
+                      border: '1px solid var(--accent)',
+                      marginBottom: 16
+                    }} 
+                  />
+                )}
+              </div>
+
               <div style={{ marginBottom: 16 }}>
                 <label style={{ fontSize: 12, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 8 }}>
                   Room Code
@@ -193,7 +421,12 @@ function ReceiveContent() {
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
               {activeTransfers.map((t) => (
-                <ActiveTransferRow key={t.fileId} transfer={t} />
+                <ActiveTransferRow 
+                  key={t.fileId} 
+                  transfer={t} 
+                  isPendingStream={pendingStreams.has(t.fileId)}
+                  onSetLocation={() => handleSetSaveLocation(t.fileId)}
+                />
               ))}
             </div>
           </div>
@@ -295,6 +528,8 @@ export default function ReceivePage() {
 
 function ActiveTransferRow({
   transfer,
+  isPendingStream,
+  onSetLocation,
 }: {
   transfer: {
     fileId: string;
@@ -306,6 +541,8 @@ function ActiveTransferRow({
     eta: number;
     status: string;
   };
+  isPendingStream?: boolean;
+  onSetLocation?: () => void;
 }) {
   return (
     <div>
@@ -330,13 +567,26 @@ function ActiveTransferRow({
           </div>
         </div>
         <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--accent)', flexShrink: 0 }}>
-          {transfer.percentage.toFixed(0)}%
+          {isPendingStream ? '⏸' : `${transfer.percentage.toFixed(0)}%`}
         </div>
       </div>
 
-      <div className="progress-track" style={{ height: 8, borderRadius: 4 }}>
-        <div className="progress-fill" style={{ height: '100%', width: `${transfer.percentage}%` }} />
-      </div>
+      {isPendingStream ? (
+        <div className="animate-fade-in" style={{ 
+          padding: '12px', background: 'var(--accent-dim)', 
+          borderRadius: 8, border: '1px solid var(--accent)',
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center'
+        }}>
+          <span style={{ fontSize: 13, fontWeight: 500 }}>Choose where to save this file to start the transfer</span>
+          <button className="btn btn-primary" onClick={onSetLocation} style={{ padding: '6px 12px', fontSize: 12 }}>
+            📂 Set Location
+          </button>
+        </div>
+      ) : (
+        <div className="progress-track" style={{ height: 8, borderRadius: 4 }}>
+          <div className="progress-fill" style={{ height: '100%', width: `${transfer.percentage}%` }} />
+        </div>
+      )}
     </div>
   );
 }

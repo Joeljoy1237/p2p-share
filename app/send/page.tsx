@@ -18,11 +18,13 @@ export default function SendPage() {
     status,
     room,
     connectedPeers,
+    pendingPeers,
     transfers,
     createRoom,
     leaveRoom,
     sendFiles,
-    cancelTransfer,
+    pauseTransfer,
+    resumeTransfer,
     error,
     myPeerId,
   } = useSignaling();
@@ -51,6 +53,38 @@ export default function SendPage() {
       });
     }
   }, []);
+
+  const handleFolderSelect = async () => {
+    try {
+      // @ts-ignore
+      const dirHandle = await window.showDirectoryPicker();
+      const selectedFiles: File[] = [];
+      
+      const processHandle = async (handle: any, path = '') => {
+        for await (const entry of handle.values()) {
+          const entryPath = path ? `${path}/${entry.name}` : entry.name;
+          if (entry.kind === 'file') {
+            const file = await entry.getFile();
+            // We can't easily preserve path in standard File object name, 
+            // but we can try to wrap it or just send flat for now.
+            // For now, let's just send the file.
+            selectedFiles.push(file);
+          } else if (entry.kind === 'directory') {
+            await processHandle(entry, entryPath);
+          }
+        }
+      };
+
+      await processHandle(dirHandle);
+      
+      setFiles((prev) => {
+        const existing = new Set(prev.map((f) => f.name + f.size));
+        return [...prev, ...selectedFiles.filter((f) => !existing.has(f.name + f.size))];
+      });
+    } catch (err) {
+      console.error('Folder picker error:', err);
+    }
+  };
 
   const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = Array.from(e.target.files || []);
@@ -172,44 +206,66 @@ export default function SendPage() {
           )}
 
           {/* Drop Zone */}
-          <div
-            className={`drop-zone ${isDragging ? 'active' : ''}`}
-            onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
-            onDragLeave={() => setIsDragging(false)}
-            onDrop={handleDrop}
-            onClick={() => inputRef.current?.click()}
-            style={{
-              padding: files.length === 0 ? '64px 32px' : '24px 32px',
-              textAlign: 'center',
-              cursor: 'pointer',
-              transition: 'all 0.3s',
-            }}
-          >
-            <input
-              ref={inputRef}
-              type="file"
-              multiple
-              onChange={handleFileInput}
-              style={{ display: 'none' }}
-            />
-            {files.length === 0 ? (
-              <>
-                <div className="animate-float" style={{ fontSize: 56, marginBottom: 16 }}>
-                  {isDragging ? '📂' : '📁'}
+          {isInRoom && (
+            <div
+              className={`drop-zone ${isDragging ? 'active' : ''}`}
+              onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+              onDragLeave={() => setIsDragging(false)}
+              onDrop={handleDrop}
+              onClick={() => inputRef.current?.click()}
+              style={{
+                padding: files.length === 0 ? '64px 32px' : '24px 32px',
+                textAlign: 'center',
+                cursor: 'pointer',
+                transition: 'all 0.3s',
+              }}
+            >
+              <input
+                ref={inputRef}
+                type="file"
+                multiple
+                onChange={handleFileInput}
+                style={{ display: 'none' }}
+              />
+              {files.length === 0 ? (
+                <>
+                  <div className="animate-float" style={{ fontSize: 56, marginBottom: 16 }}>
+                    {isDragging ? '📂' : '📁'}
+                  </div>
+                  <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>
+                    {isDragging ? 'Drop files here' : 'Drop files or click to browse'}
+                  </div>
+                  <div style={{ color: 'var(--text-2)', fontSize: 14, marginBottom: 16 }}>
+                    Any file type · Any size · Multiple files supported
+                  </div>
+                  {typeof window !== 'undefined' && 'showDirectoryPicker' in window && (
+                    <button 
+                      className="btn btn-ghost" 
+                      onClick={(e) => { e.stopPropagation(); handleFolderSelect(); }}
+                      style={{ fontSize: 13, padding: '8px 16px' }}
+                    >
+                      📂 Send Folder
+                    </button>
+                  )}
+                </>
+              ) : (
+                <div style={{ display: 'flex', justifyContent: 'center', gap: 16, alignItems: 'center' }}>
+                  <div style={{ fontSize: 14, color: 'var(--text-2)' }}>
+                    + Drop more files here
+                  </div>
+                  {typeof window !== 'undefined' && 'showDirectoryPicker' in window && (
+                    <button 
+                      className="btn btn-ghost" 
+                      onClick={(e) => { e.stopPropagation(); handleFolderSelect(); }}
+                      style={{ fontSize: 13, padding: '4px 12px' }}
+                    >
+                      📂 Add Folder
+                    </button>
+                  )}
                 </div>
-                <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>
-                  {isDragging ? 'Drop files here' : 'Drop files or click to browse'}
-                </div>
-                <div style={{ color: 'var(--text-2)', fontSize: 14 }}>
-                  Any file type · Any size · Multiple files supported
-                </div>
-              </>
-            ) : (
-              <div style={{ fontSize: 14, color: 'var(--text-2)' }}>
-                + Drop more files here
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          )}
 
           {/* File list */}
           {files.length > 0 && (
@@ -282,7 +338,7 @@ export default function SendPage() {
                 {isTransferring && (
                   <button
                     className="btn btn-danger"
-                    onClick={cancelTransfer}
+                    onClick={pauseTransfer}
                   >
                     Pause
                   </button>
@@ -352,7 +408,7 @@ export default function SendPage() {
                 Connected Peers
               </div>
 
-              {connectedPeers.length === 0 ? (
+              {connectedPeers.length === 0 && pendingPeers.length === 0 ? (
                 <div style={{
                   padding: '20px', textAlign: 'center',
                   border: '1px dashed var(--border)', borderRadius: 10,
@@ -374,6 +430,19 @@ export default function SendPage() {
                         {peerId.slice(0, 8)}...
                       </span>
                       <span className="tag tag-green">Online</span>
+                    </div>
+                  ))}
+                  {pendingPeers.map((peerId) => (
+                    <div key={peerId} style={{
+                      display: 'flex', alignItems: 'center', gap: 10,
+                      padding: '10px 14px', background: 'var(--surface-2)',
+                      borderRadius: 8, opacity: 0.7,
+                    }}>
+                      <div className="status-dot connecting" />
+                      <span className="mono" style={{ fontSize: 12, color: 'var(--text-2)', flex: 1 }}>
+                        {peerId.slice(0, 8)}...
+                      </span>
+                      <span className="tag tag-amber">Connecting...</span>
                     </div>
                   ))}
                 </div>

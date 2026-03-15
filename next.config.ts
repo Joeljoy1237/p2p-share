@@ -10,7 +10,7 @@ const nextConfig: NextConfig = {
       dgram: { browser: './lib/empty.js' },
     },
   },
-  allowedDevOrigins: ["players-airports-sorry-spin.trycloudflare.com"],
+  allowedDevOrigins: ["level-newspapers-comment-josh.trycloudflare.com", "players-airports-sorry-spin.trycloudflare.com"],
 
 };
 

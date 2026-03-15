@@ -301,3 +301,90 @@ body::before {
 .tag-red { background: var(--red-dim); color: var(--red); }
 .tag-blue { background: rgba(91, 106, 247, 0.15); color: var(--accent); }
 .tag-amber { background: rgba(245, 158, 11, 0.15); color: var(--amber); }
+
+/* Switch Toggle */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 24px;
+}
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background-color: var(--surface-3);
+  transition: .4s;
+  border-radius: 34px;
+}
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  transition: .4s;
+  border-radius: 50%;
+}
+input:checked + .slider {
+  background-color: var(--accent);
+}
+input:focus + .slider {
+  box-shadow: 0 0 1px var(--accent);
+}
+input:checked + .slider:before {
+  transform: translateX(20px);
+}
+input:disabled + .slider {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* QR Scanner Overrides */
+#qr-reader {
+  border: none !important;
+}
+#qr-reader__dashboard {
+  padding: 20px !important;
+  background: var(--surface) !important;
+}
+#qr-reader__camera_selection {
+  background: var(--surface-2) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--border) !important;
+  padding: 8px !important;
+  border-radius: 8px !important;
+  margin-bottom: 10px !important;
+  width: 100% !important;
+}
+#qr-reader img {
+  display: none !important;
+}
+#qr-reader button {
+  background: var(--accent) !important;
+  color: white !important;
+  border: none !important;
+  padding: 10px 20px !important;
+  border-radius: 8px !important;
+  font-weight: 600 !important;
+  cursor: pointer !important;
+  margin: 5px !important;
+}
+#qr-reader button:hover {
+  background: var(--accent-2) !important;
+}
+#qr-reader__scan_region {
+  background: black !important;
+}
+#qr-reader__status_span {
+  display: none !important;
+}
+
+

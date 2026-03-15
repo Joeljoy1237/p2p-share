@@ -138,17 +138,26 @@ io.on('connection', (socket) => {
   // WebRTC Signaling
   socket.on('signal', ({ targetPeerId, signal }) => {
     const roomId = peerToRoom.get(socket.id);
-    if (!roomId) return;
+    if (!roomId) {
+      console.warn(`[SIGNAL] No room for ${socket.id}`);
+      return;
+    }
 
     const room = rooms.get(roomId);
-    if (!room) return;
+    if (!room) {
+      console.warn(`[SIGNAL] Room ${roomId} not found for ${socket.id}`);
+      return;
+    }
 
     const targetSocket = room.peers.get(targetPeerId);
     if (targetSocket) {
+      console.log(`[SIGNAL] ${socket.id} -> ${targetPeerId} (${signal.type})`);
       targetSocket.emit('signal', {
         peerId: socket.id,
         signal,
       });
+    } else {
+      console.warn(`[SIGNAL] Target ${targetPeerId} not found in room ${room.code}`);
     }
   });
 

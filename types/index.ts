@@ -94,4 +94,5 @@ export interface RTCConfig {
   iceServers: ICEServer[];
   iceTransportPolicy?: 'all' | 'relay';
   bundlePolicy?: 'balanced' | 'max-bundle' | 'max-compat';
+  iceCandidatePoolSize?: number;
 }
