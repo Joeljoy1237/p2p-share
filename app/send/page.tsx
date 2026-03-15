@@ -25,6 +25,7 @@ export default function SendPage() {
     sendFiles,
     pauseTransfer,
     resumeTransfer,
+    cancelTransfer,
     error,
     myPeerId,
   } = useSignaling();
@@ -336,12 +337,23 @@ export default function SendPage() {
                 </button>
 
                 {isTransferring && (
-                  <button
-                    className="btn btn-danger"
-                    onClick={pauseTransfer}
-                  >
-                    Pause
-                  </button>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button
+                      className="btn btn-ghost"
+                      onClick={pauseTransfer}
+                    >
+                      Pause
+                    </button>
+                    <button
+                      className="btn btn-danger"
+                      onClick={() => {
+                        cancelTransfer();
+                        setFiles([]); // Clear local UI queue too
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
                 )}
               </div>
             </div>

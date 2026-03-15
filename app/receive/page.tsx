@@ -43,9 +43,12 @@ function ReceiveContent() {
         // If it doesn't throw, the file exists
         finalName = `${base} (${counter})${ext}`;
         counter++;
-      } catch (e) {
-        // If it throws, the file name is available
-        return await dirHandle.getFileHandle(finalName, { create: true });
+      } catch (e: any) {
+        // If it throws NotFoundError, the file name is available
+        if (e.name === 'NotFoundError') {
+          return await dirHandle.getFileHandle(finalName, { create: true });
+        }
+        throw e;
       }
     }
   };

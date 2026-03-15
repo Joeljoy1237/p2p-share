@@ -8,9 +8,9 @@ import type {
   RTCConfig,
 } from '@/types';
 
-const CHUNK_SIZE = 128 * 1024; // 128KB chunks (safer for SCTP limits)
-const MAX_BUFFERED_AMOUNT = 4 * 1024 * 1024; // 4MB buffer limit (safer)
-const BUFFER_THRESHOLD = 2 * 1024 * 1024; // 2MB threshold before resuming (half of max)
+const CHUNK_SIZE = 256 * 1024; // 256KB chunks (optimal high bandwidth size)
+const MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024; // 16MB buffer limit for high throughput
+const BUFFER_THRESHOLD = 8 * 1024 * 1024; // 8MB threshold before resuming pipeline
 
 export const DEFAULT_RTC_CONFIG: RTCConfig = {
   iceServers: [
@@ -70,11 +70,15 @@ export class P2PConnection {
   private sendStart = 0;
   private lastSpeedCalc = 0;
   private lastBytesSent = 0;
+  private currentSpeed = 0;
+  private lastProgressEmit = 0;
+  private completedFiles: Set<string> = new Set();
 
   // Receive state
   private receiveBuffers: Map<string, ArrayBuffer[]> = new Map();
   private receiveMetas: Map<string, FileMetadata> = new Map();
   private receiveProgress: Map<string, number> = new Map();
+  private receiveStats: Map<string, { lastSpeedCalc: number, lastBytesReceived: number, currentSpeed: number }> = new Map();
   private writableStreams: Map<string, any> = new Map(); // using any for FileSystemWritableFileStream to avoid type issues in older environments
   private iceCandidatesQueue: RTCIceCandidateInit[] = [];
 
@@ -94,9 +98,21 @@ export class P2PConnection {
     this.writableStreams.set(fileId, stream);
     const buffered = this.receiveBuffers.get(fileId) || [];
     if (buffered.length > 0) {
-      buffered.forEach((chunk, index) => {
-        if (chunk) stream.write({ type: 'write', position: index * CHUNK_SIZE, data: chunk });
-      });
+      (async () => {
+        try {
+          for (let index = 0; index < buffered.length; index++) {
+            const chunk = buffered[index];
+            if (chunk) {
+              await stream.write({ type: 'write', position: index * CHUNK_SIZE, data: chunk });
+            }
+          }
+          this.receiveBuffers.delete(fileId);
+        } catch (err) {
+          console.error('[P2P] Error writing buffered chunks:', err);
+        }
+      })();
+    } else {
+      this.receiveBuffers.delete(fileId);
     }
   }
 
@@ -193,14 +209,28 @@ export class P2PConnection {
       const received = (this.receiveProgress.get(fileId) || 0) + chunk.byteLength;
       this.receiveProgress.set(fileId, received);
 
+      let stats = this.receiveStats.get(fileId);
+      if (!stats) {
+        stats = { lastSpeedCalc: Date.now(), lastBytesReceived: 0, currentSpeed: 0 };
+        this.receiveStats.set(fileId, stats);
+      }
+
+      const now = Date.now();
+      const elapsed = (now - stats.lastSpeedCalc) / 1000;
+      if (elapsed > 0.5) {
+        stats.currentSpeed = (received - stats.lastBytesReceived) / elapsed;
+        stats.lastBytesReceived = received;
+        stats.lastSpeedCalc = now;
+      }
+
       const progress: TransferProgress = {
         fileId,
         fileName: meta.name,
         totalSize: meta.size,
         transferredBytes: received,
         percentage: Math.min(100, (received / meta.size) * 100),
-        speed: 0,
-        eta: 0,
+        speed: stats.currentSpeed,
+        eta: stats.currentSpeed > 0 ? (meta.size - received) / stats.currentSpeed : 0,
         status: 'transferring',
       };
       this.emit('progress', progress);
@@ -221,8 +251,15 @@ export class P2PConnection {
       case 'file-end':
         const stream = this.writableStreams.get(msg.fileId);
         if (stream) {
-          await stream.close();
+          try {
+            await stream.close();
+          } catch (err) {
+            console.error('[P2P] Error closing file stream:', err);
+          }
           this.writableStreams.delete(msg.fileId);
+          this.receiveStats.delete(msg.fileId);
+          this.receiveBuffers.delete(msg.fileId);
+          this.receiveProgress.delete(msg.fileId);
           // Signal completion without assembling in memory
           const meta = this.receiveMetas.get(msg.fileId);
           if (meta) {
@@ -250,14 +287,29 @@ export class P2PConnection {
         break;
 
       case 'cancel':
-        const s = this.writableStreams.get(msg.fileId);
-        if (s) {
-          await s.abort();
-          this.writableStreams.delete(msg.fileId);
+        // If fileId is provided, cancel specific file, otherwise cancel ALL
+        if (msg.fileId) {
+          const s = this.writableStreams.get(msg.fileId);
+          if (s) {
+            await s.abort().catch(() => {});
+            this.writableStreams.delete(msg.fileId);
+          }
+          this.receiveBuffers.delete(msg.fileId);
+          this.receiveMetas.delete(msg.fileId);
+          this.receiveProgress.delete(msg.fileId);
+          this.receiveStats.delete(msg.fileId);
+        } else {
+          // Global cancel
+          for (const [id, s] of this.writableStreams.entries()) {
+            await s.abort().catch(() => {});
+          }
+          this.writableStreams.clear();
+          this.receiveBuffers.clear();
+          this.receiveMetas.clear();
+          this.receiveProgress.clear();
+          this.receiveStats.clear();
+          this.emit('disconnected', { cancelled: true });
         }
-        this.receiveBuffers.delete(msg.fileId);
-        this.receiveMetas.delete(msg.fileId);
-        this.receiveProgress.delete(msg.fileId);
         break;
     }
   }
@@ -282,6 +334,7 @@ export class P2PConnection {
 
     this.receiveBuffers.delete(fileId);
     this.receiveProgress.delete(fileId);
+    this.receiveStats.delete(fileId);
 
     this.emit('file-received', {
       fileId,
@@ -373,28 +426,65 @@ export class P2PConnection {
   }
 
   sendFiles(files: File[]) {
-    // Deduplicate incoming files against the current queue and active file
+    // Deduplicate against active file AND current queue
     const filtered = files.filter(f => {
-      const isSending = this.currentSendFile && 
-        this.currentSendFile.name === f.name && 
-        this.currentSendFile.size === f.size &&
-        this.currentSendFile.lastModified === f.lastModified;
+      const fileKey = `${f.name}-${f.size}`;
+      
+      if (this.completedFiles.has(fileKey)) {
+        console.warn(`[P2P] Skipping duplicate file that was already completed: ${f.name}`);
+        return false;
+      }
+
+      const activeMeta = this.currentSendMeta;
+      const isSending = activeMeta && 
+        activeMeta.name === f.name && 
+        activeMeta.size === f.size;
       
       const inQueue = this.sendQueue.some(q => 
-        q.name === f.name && q.size === f.size && q.lastModified === f.lastModified
+        q.name === f.name && q.size === f.size
       );
 
       if (isSending || inQueue) {
-        console.warn(`[P2P] Skipping duplicate file: ${f.name}`);
+        console.warn(`[P2P] Skipping duplicate file already in process: ${f.name}`);
         return false;
       }
       return true;
     });
 
+    if (filtered.length === 0) return;
+
     this.sendQueue.push(...filtered);
     if (!this.currentSendFile) {
       this.sendNextFile();
     }
+  }
+
+  cancelTransfer() {
+    // Clear whole queue
+    this.sendQueue = [];
+    this.sendPaused = false;
+    this.isSending = false;
+    this.completedFiles.clear();
+    
+    // Notify receiver
+    const msg: ChunkMessage = { type: 'cancel', fileId: '' }; // Empty fileId = cancel everything
+    this.send(JSON.stringify(msg));
+    
+    // UI feedback
+    if (this.currentSendMeta) {
+      this.emit('progress', {
+        fileId: this.currentSendMeta.id,
+        fileName: this.currentSendMeta.name,
+        totalSize: this.currentSendMeta.size,
+        transferredBytes: this.totalSent,
+        percentage: 0,
+        speed: 0,
+        eta: 0,
+        status: 'error',
+      });
+    }
+    
+    this.resetSendState();
   }
 
   private sendNextFile() {
@@ -408,6 +498,8 @@ export class P2PConnection {
     this.sendStart = Date.now();
     this.lastSpeedCalc = Date.now();
     this.lastBytesSent = 0;
+    this.currentSpeed = 0;
+    this.lastProgressEmit = 0;
 
     const meta: FileMetadata = {
       id: uuidv4(),
@@ -442,10 +534,11 @@ export class P2PConnection {
     const file = this.currentSendFile;
     const meta = this.currentSendMeta;
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    let chunkIndex = Math.floor(this.totalSent / CHUNK_SIZE);
+    let loopStart = Date.now();
 
-    const sendChunk = async (chunkIndex: number): Promise<void> => {
-      // Check for interruption: pause, cancellation, or channel close
-      if (chunkIndex >= totalChunks || this.sendPaused || !this.isSending) {
+    while (chunkIndex < totalChunks) {
+      if (this.sendPaused || !this.isSending) {
         this.isSending = false;
         return;
       }
@@ -457,7 +550,6 @@ export class P2PConnection {
       }
 
       if (this.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-        console.log('[P2P] Buffer full, pausing send loop');
         this.sendPaused = true;
         this.isSending = false;
         return;
@@ -479,6 +571,7 @@ export class P2PConnection {
         combined.set(new Uint8Array(header), 0);
         combined.set(new Uint8Array(sliceBuffer), header.byteLength);
 
+        // check again post-await
         if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
           this.isSending = false;
           return;
@@ -496,49 +589,68 @@ export class P2PConnection {
           }
           throw e;
         }
+
         this.totalSent += sliceBuffer.byteLength;
+        chunkIndex++;
 
         const now = Date.now();
-        const elapsed = (now - this.lastSpeedCalc) / 1000;
-        let speed = 0;
-        if (elapsed > 0.5) {
-          speed = (this.totalSent - this.lastBytesSent) / elapsed;
+        const elapsedSpeed = (now - this.lastSpeedCalc) / 1000;
+        if (elapsedSpeed > 0.5) {
+          this.currentSpeed = (this.totalSent - this.lastBytesSent) / elapsedSpeed;
           this.lastBytesSent = this.totalSent;
           this.lastSpeedCalc = now;
         }
 
-        const progress: TransferProgress = {
-          fileId: meta.id,
-          fileName: meta.name,
-          totalSize: file.size,
-          transferredBytes: this.totalSent,
-          percentage: Math.min(100, (this.totalSent / file.size) * 100),
-          speed,
-          eta: speed > 0 ? (file.size - this.totalSent) / speed : 0,
-          status: 'transferring',
-        };
-        this.emit('progress', progress);
-
-        if (chunkIndex + 1 < totalChunks) {
-          // Use setTimeout(0) or queueMicrotask to stay responsive
-          // We don't want to use await here to keep the event loop moving
-          setTimeout(() => sendChunk(chunkIndex + 1), 0);
-        } else {
-          console.log(`[P2P] File sent completely: ${meta.name}`);
-          const endMsg: ChunkMessage = { type: 'file-end', fileId: meta.id };
-          this.send(JSON.stringify(endMsg));
-          this.emit('progress', { ...progress, percentage: 100, status: 'completed' as TransferStatus });
-          this.resetSendState();
-          setTimeout(() => this.sendNextFile(), 100);
+        // Throttle progress events to ~100ms
+        if (now - this.lastProgressEmit > 100) {
+          const progress: TransferProgress = {
+            fileId: meta.id,
+            fileName: meta.name,
+            totalSize: file.size,
+            transferredBytes: this.totalSent,
+            percentage: Math.min(100, (this.totalSent / file.size) * 100),
+            speed: this.currentSpeed,
+            eta: this.currentSpeed > 0 ? (file.size - this.totalSent) / this.currentSpeed : 0,
+            status: 'transferring',
+          };
+          this.emit('progress', progress);
+          this.lastProgressEmit = now;
         }
+
+        // Keep UI responsive by yielding if we've been spinning in the tight loop for over 16ms
+        if (Date.now() - loopStart > 16) {
+          await new Promise(resolve => setTimeout(resolve, 0));
+          loopStart = Date.now();
+        }
+
       } catch (err) {
         console.error('[P2P] Send chunk failure:', err);
         this.emit('error', `Send failure: ${err}`);
         this.isSending = false;
+        return;
       }
-    };
+    }
 
-    sendChunk(Math.floor(this.totalSent / CHUNK_SIZE));
+    if (chunkIndex >= totalChunks) {
+      console.log(`[P2P] File sent completely: ${meta.name}`);
+      const endMsg: ChunkMessage = { type: 'file-end', fileId: meta.id };
+      this.send(JSON.stringify(endMsg));
+      
+      const finalProgress: TransferProgress = {
+        fileId: meta.id,
+        fileName: meta.name,
+        totalSize: file.size,
+        transferredBytes: file.size,
+        percentage: 100,
+        speed: this.currentSpeed,
+        eta: 0,
+        status: 'completed',
+      };
+      this.emit('progress', finalProgress);
+      this.completedFiles.add(`${meta.name}-${file.size}`);
+      this.resetSendState();
+      setTimeout(() => this.sendNextFile(), 100);
+    }
   }
 
   pauseTransfer() {

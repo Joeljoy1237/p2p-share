@@ -33,6 +33,7 @@ export interface UseSignalingReturn {
   setFileStream: (peerId: string, fileId: string, stream: any) => void;
   pauseTransfer: () => void;
   resumeTransfer: () => void;
+  cancelTransfer: () => void;
   onFileStart?: (peerId: string, fileId: string, metadata: FileMetadata) => void;
   error: string | null;
 }
@@ -103,13 +104,18 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
       setStatus('connected');
     });
 
-    conn.on('disconnected', () => {
-      console.log(`[SIGNALING] P2P disconnected from ${peerId}`);
+    conn.on('disconnected', (data) => {
+      console.log(`[SIGNALING] P2P disconnected from ${peerId}`, data);
       clearTimeout(watchdog);
       connectionsRef.current.delete(peerId);
       setPendingPeers(prev => prev.filter(id => id !== peerId));
       setConnectedPeers((prev) => prev.filter((id) => id !== peerId));
       if (connectionsRef.current.size === 0) setStatus('connected');
+      
+      // Pass cancellation signal to UI if present
+      if ((data as any)?.cancelled) {
+        setTransfers(new Map());
+      }
     });
 
     conn.on('progress', (data) => {
@@ -134,10 +140,13 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
 
     conn.on('file-received', (data) => {
       const item = data as ReceivedFile;
-      setReceivedFiles((prev) => [
-        ...prev,
-        { ...item, receivedAt: Date.now() },
-      ]);
+      setReceivedFiles((prev) => {
+        if (prev.some(f => f.fileId === item.fileId)) return prev;
+        return [
+          ...prev,
+          { ...item, receivedAt: Date.now() },
+        ];
+      });
     });
 
     conn.on('ice-candidate', (data) => {
@@ -406,6 +415,12 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
     });
   }, []);
 
+  const cancelTransfer = useCallback(() => {
+    connectionsRef.current.forEach((conn) => {
+      conn.cancelTransfer();
+    });
+  }, []);
+
   return {
     status,
     room,
@@ -421,6 +436,7 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
     setFileStream,
     pauseTransfer,
     resumeTransfer,
+    cancelTransfer,
     error,
   };
 }
