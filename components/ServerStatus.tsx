@@ -1,9 +1,11 @@
 'use client';
 import { useState, useEffect } from 'react';
+import { motion } from 'framer-motion';
+import { RefreshCw, Activity, Network } from 'lucide-react';
 import { useSignaling } from '@/lib/use-signaling';
 
 export default function ServerStatus() {
-  const { checkServerHealth, status } = useSignaling();
+  const { checkServerHealth } = useSignaling();
   const [serverState, setServerState] = useState<{
     alive: boolean;
     checking: boolean;
@@ -27,78 +29,41 @@ export default function ServerStatus() {
 
   useEffect(() => {
     check();
-    // Auto check every 30 seconds
     const interval = setInterval(check, 30000);
     return () => clearInterval(interval);
   }, []);
 
   return (
-    <div className="glass" style={{
-      padding: '8px 16px',
-      borderRadius: '20px',
-      display: 'flex',
-      alignItems: 'center',
-      gap: 12,
-      fontSize: 13,
-      border: '1px solid var(--border)',
-      background: 'rgba(255, 255, 255, 0.03)',
-    }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <div style={{
-          width: 8,
-          height: 8,
-          borderRadius: '50%',
-          backgroundColor: serverState.alive ? 'var(--green)' : 'var(--red)',
-          boxShadow: serverState.alive ? '0 0 8px var(--green)' : '0 0 8px var(--red)',
-          animation: serverState.checking ? 'pulse 1s infinite' : 'none'
-        }} />
-        <span style={{ fontWeight: 500, color: 'var(--text-2)' }}>
-          Server {serverState.alive ? 'Online' : 'Offline'}
+    <div className="glass flex items-center gap-3 px-4 py-2 rounded-full text-[13px] border border-border bg-[rgba(255,255,255,0.02)]">
+      <div className="flex items-center gap-2">
+        <div className={`status-dot ${serverState.alive ? 'connected' : 'error'} ${serverState.checking ? 'animate-pulse' : ''}`} />
+        <span className="font-medium text-text-2">
+          {serverState.alive ? 'Server Online' : 'Server Offline'}
         </span>
       </div>
 
       {serverState.alive && serverState.stats && (
-        <div style={{ display: 'flex', gap: 12, color: 'var(--text-3)', fontSize: 11, borderLeft: '1px solid var(--border)', paddingLeft: 12 }}>
-          <span>Rooms: {Math.floor(serverState.stats.rooms)}</span>
-          <span className="hide-mobile">Uptime: {Math.floor(serverState.stats.uptime / 60)}m</span>
+        <div className="hidden sm:flex items-center gap-3 text-text-3 text-[11px] border-l border-border pl-3 font-mono">
+          <span className="flex items-center gap-1">
+            <Network className="w-3 h-3" /> {Math.floor(serverState.stats.rooms)}
+          </span>
+          <span className="hidden md:flex items-center gap-1">
+            <Activity className="w-3 h-3" /> {Math.floor(serverState.stats.uptime / 60)}m
+          </span>
         </div>
       )}
 
-      <button
+      <motion.button
         onClick={check}
         disabled={serverState.checking}
-        style={{
-          background: 'none',
-          border: 'none',
-          color: 'var(--accent)',
-          cursor: 'pointer',
-          padding: 4,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          transition: 'transform 0.2s',
-          transform: serverState.checking ? 'rotate(360deg)' : 'none',
-        }}
+        whileHover={{ rotate: 180 }}
+        whileTap={{ scale: 0.85 }}
+        transition={{ type: 'spring', stiffness: 300, damping: 20 }}
+        className="text-accent cursor-pointer p-1 flex items-center justify-center disabled:opacity-40 border-none bg-transparent outline-none"
         title="Refresh Status"
       >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M21 2v6h-6" />
-          <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
-          <path d="M3 22v-6h6" />
-          <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
-        </svg>
-      </button>
-
-      <style jsx>{`
-        @keyframes pulse {
-          0% { opacity: 1; }
-          50% { opacity: 0.4; }
-          100% { opacity: 1; }
-        }
-        @media (max-width: 600px) {
-          .hide-mobile { display: none; }
-        }
-      `}</style>
+        <RefreshCw className={`w-3.5 h-3.5 ${serverState.checking ? 'animate-spin' : ''}`} />
+      </motion.button>
     </div>
   );
 }

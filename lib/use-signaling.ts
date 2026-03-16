@@ -57,6 +57,12 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
   const [error, setError] = useState<string | null>(null);
   const roomRef = useRef<Room | null>(null);
   const passwordRef = useRef<string>('');
+  const connectedPeersRef = useRef<string[]>([]);
+
+  // Keep connectedPeers ref in sync
+  useEffect(() => {
+    connectedPeersRef.current = connectedPeers;
+  }, [connectedPeers]);
 
   // Keep room ref in sync
   useEffect(() => {
@@ -83,7 +89,7 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
     
     // Watchdog to cleanup if connection never establishes
     const watchdog = setTimeout(() => {
-      if (connectionsRef.current.get(peerId) === conn && connectedPeers.indexOf(peerId) === -1) {
+      if (connectionsRef.current.get(peerId) === conn && connectedPeersRef.current.indexOf(peerId) === -1) {
         console.warn(`[SIGNALING] Connection watchdog timed out for ${peerId}`);
         setPendingPeers(prev => prev.filter(id => id !== peerId));
         setError(`Connection timeout with ${peerId.slice(0, 4)}. Check network/firewall.`);
@@ -203,7 +209,7 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
     }
 
     return conn;
-  }, [connectedPeers]);
+  }, []); // Now stable because we use Refs for connectedPeers
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -272,10 +278,12 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
         if (signal.type === 'offer') {
           const conn = getOrCreateConnection(peerId, false);
           const answer = await conn.handleOffer(signal.sdp!);
-          s.emit('signal', {
-            targetPeerId: peerId,
-            signal: { type: 'answer', sdp: answer },
-          });
+          if (answer) {
+            s.emit('signal', {
+              targetPeerId: peerId,
+              signal: { type: 'answer', sdp: answer },
+            });
+          }
         } else if (signal.type === 'answer') {
           const conn = connectionsRef.current.get(peerId);
           if (conn) {

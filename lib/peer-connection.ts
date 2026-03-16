@@ -81,6 +81,7 @@ export class P2PConnection {
   private receiveStats: Map<string, { lastSpeedCalc: number, lastBytesReceived: number, currentSpeed: number }> = new Map();
   private writableStreams: Map<string, any> = new Map(); // using any for FileSystemWritableFileStream to avoid type issues in older environments
   private iceCandidatesQueue: RTCIceCandidateInit[] = [];
+  private isSettingRemoteDescription = false;
 
   constructor(
     config: RTCConfig = DEFAULT_RTC_CONFIG,
@@ -373,10 +374,17 @@ export class P2PConnection {
     return offer;
   }
 
-  async handleOffer(offer: RTCSessionDescriptionInit): Promise<RTCSessionDescriptionInit> {
+  async handleOffer(offer: RTCSessionDescriptionInit): Promise<RTCSessionDescriptionInit | null> {
+    if (this.isSettingRemoteDescription) {
+      console.warn(`[P2P] Already setting remote description for ${this.remotePeerId}, skipping offer`);
+      return null;
+    }
+    
+    this.isSettingRemoteDescription = true;
     try {
       console.log(`[P2P] Handling offer from ${this.remotePeerId}`);
       if (this.pc.signalingState !== 'stable') {
+        console.log(`[P2P] Signalling state: ${this.pc.signalingState}, rolling back for ${this.remotePeerId}`);
         await this.pc.setRemoteDescription({ type: 'rollback' } as RTCSessionDescriptionInit).catch(() => {});
       }
       await this.pc.setRemoteDescription(offer);
@@ -388,20 +396,39 @@ export class P2PConnection {
     } catch (err) {
       console.error(`[P2P] Error handling offer from ${this.remotePeerId}:`, err);
       throw err;
+    } finally {
+      this.isSettingRemoteDescription = false;
     }
   }
 
   async handleAnswer(answer: RTCSessionDescriptionInit) {
-    try {
-      if (this.pc.signalingState !== 'have-local-offer') {
-        console.warn(`[P2P] Skipping handleAnswer for ${this.remotePeerId}: state is ${this.pc.signalingState}`);
+    if (this.isSettingRemoteDescription) {
+      console.log(`[P2P] Already setting remote description for ${this.remotePeerId}, ignoring answer`);
+      return;
+    }
+
+    if (this.pc.signalingState !== 'have-local-offer') {
+      if (this.pc.signalingState === 'stable') {
+        console.log(`[P2P] Received answer for ${this.remotePeerId} but already stable, ignoring.`);
         return;
       }
+      console.warn(`[P2P] Skipping handleAnswer for ${this.remotePeerId}: state is ${this.pc.signalingState}`);
+      return;
+    }
+
+    this.isSettingRemoteDescription = true;
+    try {
       console.log(`[P2P] Handling answer from ${this.remotePeerId}`);
       await this.pc.setRemoteDescription(answer);
       await this.processQueuedCandidates();
-    } catch (err) {
+    } catch (err: any) {
+      if (err.name === 'InvalidStateError' && (this.pc.signalingState as string) === 'stable') {
+        console.log(`[P2P] Answer for ${this.remotePeerId} led to InvalidStateError but connection is stable: ignoring.`);
+        return;
+      }
       console.error(`[P2P] Error handling answer from ${this.remotePeerId}:`, err);
+    } finally {
+      this.isSettingRemoteDescription = false;
     }
   }
 

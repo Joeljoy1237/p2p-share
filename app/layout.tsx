@@ -1,7 +1,7 @@
-// app/layout.tsx
 import type { Metadata } from 'next';
+import { Space_Grotesk as SpaceGrotesk, JetBrains_Mono as JetBrainsMono } from 'next/font/google';
+import { ThemeProvider } from '@/components/ThemeProvider';
 import './globals.css';
-
 export const metadata: Metadata = {
   title: 'P2PShare — Business-Grade Peer-to-Peer File Transfer',
   description:
@@ -14,15 +14,29 @@ export const metadata: Metadata = {
   },
 };
 
+const spaceGrotesk = SpaceGrotesk({
+  subsets: ['latin'],
+  variable: '--font-space-grotesk',
+  display: 'swap',
+});
+
+const jetBrainsMono = JetBrainsMono({
+  subsets: ['latin'],
+  variable: '--font-jetbrains-mono',
+  display: 'swap',
+});
+
 export default function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
-      <body>
-        {children}
+    <html lang="en" className="dark">
+      <body className={`${spaceGrotesk.variable} ${jetBrainsMono.variable} antialiased`}>
+        <ThemeProvider>
+          {children}
+        </ThemeProvider>
       </body>
     </html>
   );
