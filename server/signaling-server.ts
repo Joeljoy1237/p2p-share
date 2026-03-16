@@ -1,10 +1,6 @@
-// server/signaling-server.js
-// Run this separately: node server/signaling-server.js
-// For production, deploy this as a standalone service
-
-const { createServer } = require('http');
-const { Server } = require('socket.io');
-const { v4: uuidv4 } = require('uuid');
+import { createServer } from 'http';
+import { Server, Socket } from 'socket.io';
+import { v4 as uuidv4 } from 'uuid';
 
 const PORT = process.env.SIGNAL_PORT || 3001;
 
@@ -19,14 +15,31 @@ const io = new Server(httpServer, {
   maxHttpBufferSize: 1e8, // 100MB for signaling messages
 });
 
-// In-memory room store (use Redis for production)
-const rooms = new Map();
-const peerToRoom = new Map();
+// Interfaces
+interface RoomOptions {
+  maxPeers?: number;
+  password?: string | null;
+}
 
-function createRoom(options = {}) {
+interface Room {
+  id: string;
+  code: string;
+  createdAt: number;
+  expiresAt: number;
+  peers: Map<string, Socket>;
+  maxPeers: number;
+  password?: string | null;
+  isPasswordProtected: boolean;
+}
+
+// In-memory room store (use Redis for production)
+const rooms = new Map<string, Room>();
+const peerToRoom = new Map<string, string>();
+
+function createRoom(options: RoomOptions = {}): Room {
   const roomId = uuidv4();
   const code = generateCode();
-  const room = {
+  const room: Room = {
     id: roomId,
     code,
     createdAt: Date.now(),
@@ -41,7 +54,7 @@ function createRoom(options = {}) {
   return room;
 }
 
-function generateCode() {
+function generateCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
   for (let i = 0; i < 6; i++) {
@@ -50,7 +63,7 @@ function generateCode() {
   return code;
 }
 
-function getRoomInfo(room) {
+function getRoomInfo(room: Room) {
   return {
     id: room.id,
     code: room.code,
@@ -78,12 +91,47 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-io.on('connection', (socket) => {
+// Rate limiting state
+const rateLimits = new Map<string, { count: number; lastReset: number }>();
+
+function isRateLimited(socketId: string, limit: number = 30, windowMs: number = 60000): boolean {
+  const now = Date.now();
+  const state = rateLimits.get(socketId) || { count: 0, lastReset: now };
+
+  if (now - state.lastReset > windowMs) {
+    state.count = 0;
+    state.lastReset = now;
+  }
+
+  state.count++;
+  rateLimits.set(socketId, state);
+
+  return state.count > limit;
+}
+
+// Cleanup rate limits every hour
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, state] of rateLimits.entries()) {
+    if (now - state.lastReset > 3600000) {
+      rateLimits.delete(id);
+    }
+  }
+}, 3600000);
+
+io.on('connection', (socket: Socket) => {
   console.log(`[+] Client connected: ${socket.id}`);
 
   // Create a new room
-  socket.on('create-room', (options, callback) => {
-    const room = createRoom(options);
+  socket.on('create-room', (options: RoomOptions, callback: (response: any) => void) => {
+    if (isRateLimited(socket.id, 10, 60000)) { // Max 10 rooms per minute
+      return callback({ success: false, error: 'Rate limit exceeded. Please wait a minute.' });
+    }
+
+    // Validate options
+    const maxPeers = Math.min(Math.max(2, options.maxPeers || 10), 50); // Hard limit 50 peers
+    const room = createRoom({ ...options, maxPeers });
+    
     socket.join(room.id);
     room.peers.set(socket.id, socket);
     peerToRoom.set(socket.id, room.id);
@@ -93,8 +141,18 @@ io.on('connection', (socket) => {
   });
 
   // Join an existing room by ID or code
-  socket.on('join-room', ({ roomIdOrCode, password }, callback) => {
-    let room = rooms.get(roomIdOrCode);
+  socket.on('join-room', (data: { roomIdOrCode: string; password?: string }, callback: (response: any) => void) => {
+    if (isRateLimited(socket.id, 60, 60000)) { // Max 60 join attempts per minute
+      return callback({ success: false, error: 'Rate limit exceeded.' });
+    }
+
+    const { roomIdOrCode, password } = data;
+    if (!roomIdOrCode) {
+      return callback({ success: false, error: 'Room details required' });
+    }
+
+    const sanitizedIdOrCode = String(roomIdOrCode).toUpperCase().trim().slice(0, 50);
+    let room = rooms.get(sanitizedIdOrCode);
 
     if (!room) {
       return callback({ success: false, error: 'Room not found' });
@@ -136,7 +194,10 @@ io.on('connection', (socket) => {
   });
 
   // WebRTC Signaling
-  socket.on('signal', ({ targetPeerId, signal }) => {
+  socket.on('signal', (data: { targetPeerId: string; signal: any }) => {
+    const { targetPeerId, signal } = data;
+    if (!targetPeerId || !signal) return;
+
     const roomId = peerToRoom.get(socket.id);
     if (!roomId) {
       console.warn(`[SIGNAL] No room for ${socket.id}`);
@@ -151,6 +212,12 @@ io.on('connection', (socket) => {
 
     const targetSocket = room.peers.get(targetPeerId);
     if (targetSocket) {
+      // Basic signal validation - prevent huge signal objects
+      if (JSON.stringify(signal).length > 100000) {
+        console.warn(`[SIGNAL] Rejected oversized signal from ${socket.id}`);
+        return;
+      }
+
       console.log(`[SIGNAL] ${socket.id} -> ${targetPeerId} (${signal.type})`);
       targetSocket.emit('signal', {
         peerId: socket.id,
@@ -162,9 +229,14 @@ io.on('connection', (socket) => {
   });
 
   // Broadcast to all peers in room
-  socket.on('broadcast-signal', ({ signal }) => {
+  socket.on('broadcast-signal', (data: { signal: any }) => {
+    const { signal } = data;
+    if (!signal) return;
+
     const roomId = peerToRoom.get(socket.id);
     if (!roomId) return;
+
+    if (JSON.stringify(signal).length > 100000) return;
 
     socket.to(roomId).emit('signal', {
       peerId: socket.id,
@@ -173,8 +245,12 @@ io.on('connection', (socket) => {
   });
 
   // Get room info
-  socket.on('get-room', ({ roomIdOrCode }, callback) => {
-    const room = rooms.get(roomIdOrCode);
+  socket.on('get-room', (data: { roomIdOrCode: string }, callback: (response: any) => void) => {
+    const { roomIdOrCode } = data;
+    if (!roomIdOrCode) return callback({ success: false });
+
+    const sanitizedIdOrCode = String(roomIdOrCode).toUpperCase().trim().slice(0, 50);
+    const room = rooms.get(sanitizedIdOrCode);
     if (!room) {
       return callback({ success: false, error: 'Room not found' });
     }
@@ -182,7 +258,10 @@ io.on('connection', (socket) => {
   });
 
   // Chat message
-  socket.on('chat-message', ({ message }) => {
+  socket.on('chat-message', (data: { message: string }) => {
+    const { message } = data;
+    if (!message || typeof message !== 'string' || message.length > 5000) return;
+
     const roomId = peerToRoom.get(socket.id);
     if (!roomId) return;
 
@@ -194,7 +273,10 @@ io.on('connection', (socket) => {
   });
 
   // Transfer metadata broadcast
-  socket.on('transfer-start', ({ files }) => {
+  socket.on('transfer-start', (data: { files: any[] }) => {
+    const { files } = data;
+    if (!Array.isArray(files) || files.length > 100) return;
+
     const roomId = peerToRoom.get(socket.id);
     if (!roomId) return;
 
@@ -234,9 +316,9 @@ httpServer.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════╗
 ║   P2P Share - Signaling Server               ║
-║   Listening on port ${PORT}                    ║
+║   Listening on port ${PORT}                     ║
 ╚══════════════════════════════════════════════╝
   `);
 });
 
-module.exports = { io, httpServer };
+export { io, httpServer };

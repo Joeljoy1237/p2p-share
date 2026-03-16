@@ -157,7 +157,17 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
     });
 
     conn.on('error', (err) => {
-      const errMsg = typeof err === 'string' ? err : JSON.stringify(err);
+      let errMsg = 'Unknown error';
+      if (typeof err === 'string') {
+        errMsg = err;
+      } else if (err instanceof Error) {
+        errMsg = err.message;
+      } else if (err && typeof err === 'object') {
+        errMsg = (err as any).message || (err as any).name || JSON.stringify(err);
+        if (errMsg === '{}') errMsg = String(err);
+      } else {
+        errMsg = String(err);
+      }
       console.error(`[SIGNALING] P2P error for ${peerId}:`, errMsg);
       
       // Ignore non-fatal flow control errors that might leak through

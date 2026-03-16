@@ -8,7 +8,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "server": "node server/signaling-server.js"
+    "server": "tsx server/signaling-server.ts"
   },
   "dependencies": {
     "@tailwindcss/postcss": "^4.2.1",
@@ -37,6 +37,7 @@
     "eslint-config-next": "16.1.6",
     "postcss": "^8.5.8",
     "tailwindcss": "^4.2.1",
+    "tsx": "^4.21.0",
     "typescript": "^5.9.3"
   }
 }

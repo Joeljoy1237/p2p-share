@@ -158,7 +158,7 @@ export class P2PConnection {
     };
 
     channel.onerror = (e: any) => {
-      const errorDetail = e.error || e.message || 'Unknown data channel error';
+      const errorDetail = e.error?.message || e.error?.name || e.message || (typeof e.error === 'string' ? e.error : null) || 'Unknown data channel error';
       console.error(`[P2P] Data channel error for ${this.remotePeerId}:`, errorDetail, e);
       this.emit('error', errorDetail);
     };
