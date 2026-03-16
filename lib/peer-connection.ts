@@ -58,6 +58,7 @@ export class P2PConnection {
   private dataChannel: RTCDataChannel | null = null;
   private peerId: string;
   private remotePeerId: string;
+  public instanceId: string = uuidv4().slice(0, 4);
   private listeners: Map<PeerEventType, PeerEventCallback[]> = new Map();
 
   // Connection readiness tracking
@@ -131,13 +132,13 @@ export class P2PConnection {
   private checkFullyConnected(source: string) {
     if (this.pcConnected && this.channelOpen && !this.connectedEmitted) {
       this.connectedEmitted = true;
-      console.log(`[P2P] Fully connected with ${this.remotePeerId} (trigger: ${source})`);
+      console.log(`[P2P][${this.instanceId}] Fully connected with ${this.remotePeerId} (trigger: ${source})`);
       this.emit('connected', { source });
     } else if (this.pcConnected && this.channelOpen && this.connectedEmitted) {
       // Already emitted, but let's confirm states
-      console.log(`[P2P] Connection status confirmed (source: ${source})`);
+      console.log(`[P2P][${this.instanceId}] Connection status confirmed (source: ${source})`);
     } else {
-      console.log(`[P2P] checkFullyConnected(${source}): pc=${this.pcConnected}, channel=${this.channelOpen}, emitted=${this.connectedEmitted}`);
+      console.log(`[P2P][${this.instanceId}] checkFullyConnected(${source}): pc=${this.pcConnected}, channel=${this.channelOpen}, emitted=${this.connectedEmitted}`);
     }
   }
 

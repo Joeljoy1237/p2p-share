@@ -39,7 +39,15 @@ const emptyRoomTimeouts = new Map<string, NodeJS.Timeout>();
 
 function createRoom(options: RoomOptions = {}): Room {
   const roomId = uuidv4();
-  const code = generateCode();
+  let code = generateCode();
+  
+  // Ensure code uniqueness (basic collision prevention)
+  let attempts = 0;
+  while (rooms.has(code) && attempts < 10) {
+    code = generateCode();
+    attempts++;
+  }
+  
   const room: Room = {
     id: roomId,
     code,
@@ -79,15 +87,23 @@ function getRoomInfo(room: Room) {
 // Cleanup expired rooms every 5 minutes
 setInterval(() => {
   const now = Date.now();
+  const processedRoomIds = new Set<string>();
+  
   for (const [key, room] of rooms.entries()) {
+    if (processedRoomIds.has(room.id)) continue;
+    processedRoomIds.add(room.id);
+
     if (room.expiresAt < now) {
-      // Disconnect all peers
+      console.log(`[CLEANUP] Room ${room.code} expired`);
       for (const [peerId, peerSocket] of room.peers.entries()) {
         peerSocket.emit('room-expired');
         peerSocket.leave(room.id);
       }
       rooms.delete(room.id);
-      rooms.delete(room.code);
+      // Only delete by code if it still points to this room
+      if (rooms.get(room.code) === room) {
+        rooms.delete(room.code);
+      }
     }
   }
 }, 5 * 60 * 1000);
@@ -162,7 +178,9 @@ io.on('connection', (socket: Socket) => {
 
     if (room.expiresAt < Date.now()) {
       rooms.delete(room.id);
-      rooms.delete(room.code);
+      if (rooms.get(room.code) === room) {
+        rooms.delete(room.code);
+      }
       return callback({ success: false, error: 'Room has expired' });
     }
 
@@ -316,6 +334,35 @@ io.on('connection', (socket: Socket) => {
     });
   });
 
+  // Leave room
+  socket.on('leave-room', () => {
+    const roomId = peerToRoom.get(socket.id);
+    if (roomId) {
+      const room = rooms.get(roomId);
+      if (room) {
+        room.peers.delete(socket.id);
+        socket.leave(roomId);
+        socket.to(roomId).emit('peer-left', {
+          peerId: socket.id,
+          peerCount: room.peers.size,
+        });
+
+        if (room.peers.size === 0) {
+          const timeout = setTimeout(() => {
+            const currentRoom = rooms.get(room.id);
+            if (currentRoom && currentRoom.peers.size === 0) {
+              rooms.delete(room.id);
+              rooms.delete(room.code);
+              emptyRoomTimeouts.delete(room.id);
+            }
+          }, 30000);
+          emptyRoomTimeouts.set(room.id, timeout);
+        }
+      }
+      peerToRoom.delete(socket.id);
+    }
+  });
+
   // Handle disconnect
   socket.on('disconnect', () => {
     const roomId = peerToRoom.get(socket.id);
@@ -328,18 +375,15 @@ io.on('connection', (socket: Socket) => {
           peerCount: room.peers.size,
         });
 
-        // Remove empty rooms after a grace period
         if (room.peers.size === 0) {
-          console.log(`[ROOM] Room ${room.code} is empty, starting 30s grace period...`);
           const timeout = setTimeout(() => {
             const currentRoom = rooms.get(room.id);
             if (currentRoom && currentRoom.peers.size === 0) {
               rooms.delete(room.id);
               rooms.delete(room.code);
               emptyRoomTimeouts.delete(room.id);
-              console.log(`[ROOM] Cleanup complete: Removed empty room ${room.code}`);
             }
-          }, 30000); // 30 seconds grace period
+          }, 30000);
           emptyRoomTimeouts.set(room.id, timeout);
         }
       }
