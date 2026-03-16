@@ -8,9 +8,61 @@ import type {
   RTCConfig,
 } from '@/types';
 
-const CHUNK_SIZE = 64 * 1024; // 64KB chunks (more compatible, smaller bursts)
-const MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1MB buffer limit for stability
-const BUFFER_THRESHOLD = 512 * 1024; // 512KB threshold before resuming pipeline
+const CHUNK_SIZE = 128 * 1024; // 128KB chunks (stable throughput, balanced overhead)
+const MAX_BUFFERED_AMOUNT = 1 * 1024 * 1024; // 1MB per-channel initial limit
+const BUFFER_THRESHOLD = 512 * 1024; // 512KB threshold
+const GLOBAL_MAX_BUFFER = 16 * 1024 * 1024; // 16MB total limit across all channels
+
+function formatBytes(bytes: number) {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+class ParallelTaskQueue {
+  private activeCount = 0;
+  private queue: (() => Promise<void>)[] = [];
+  constructor(private concurrency: number) {}
+
+  async run(task: () => Promise<void>) {
+    if (this.activeCount >= this.concurrency) {
+      await new Promise<void>(resolve => {
+        this.queue.push(async () => {
+          await task();
+          resolve();
+        });
+      });
+      return;
+    }
+
+    this.activeCount++;
+    try {
+      await task();
+    } finally {
+      this.activeCount--;
+      this.next();
+    }
+  }
+
+  private async next() {
+    if (this.queue.length > 0 && this.activeCount < this.concurrency) {
+      const nextTask = this.queue.shift()!;
+      this.activeCount++;
+      try {
+        await nextTask();
+      } finally {
+        this.activeCount--;
+        this.next();
+      }
+    }
+  }
+
+  get pending() {
+    return this.activeCount + this.queue.length;
+  }
+}
 
 export const DEFAULT_RTC_CONFIG: RTCConfig = {
   iceServers: [
@@ -55,7 +107,8 @@ type PeerEventCallback = (data: unknown) => void;
 
 export class P2PConnection {
   private pc: RTCPeerConnection;
-  private dataChannel: RTCDataChannel | null = null;
+  private dataChannels: RTCDataChannel[] = [];
+  private currentChannelIndex = 0;
   private peerId: string;
   private remotePeerId: string;
   public instanceId: string = uuidv4().slice(0, 4);
@@ -67,12 +120,18 @@ export class P2PConnection {
   private connectedEmitted = false;
   private channelReadyResolvers: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
 
+  // Performance Tuning (Adaptive)
+  private adaptiveMaxBuffer = MAX_BUFFERED_AMOUNT;
+  private adaptiveThreshold = BUFFER_THRESHOLD;
+  private numChannels = 4;
+
   // Send state
   private sendQueue: File[] = [];
   private currentSendFile: File | null = null;
   private currentSendMeta: FileMetadata | null = null;
   private sendPaused = false;
   private isSending = false;
+  private readAheadQueue: { index: number, buffer: ArrayBuffer }[] = [];
   private totalSent = 0;
   private sendStart = 0;
   private lastSpeedCalc = 0;
@@ -86,6 +145,9 @@ export class P2PConnection {
   private receiveMetas: Map<string, FileMetadata> = new Map();
   private receiveProgress: Map<string, number> = new Map();
   private receiveStats: Map<string, { lastSpeedCalc: number, lastBytesReceived: number, currentSpeed: number }> = new Map();
+  private fileIdDecoder = new TextDecoder();
+  private fileIdDecoderCache: Map<string, string> = new Map(); // Cache decoded fileIds
+  private receiverPaused = false; // Backpressure state
   private writableStreams: Map<string, any> = new Map(); // using any for FileSystemWritableFileStream to avoid type issues in older environments
   private iceCandidatesQueue: RTCIceCandidateInit[] = [];
   private isSettingRemoteDescription = false;
@@ -93,6 +155,11 @@ export class P2PConnection {
   // Message queue for serialized processing — prevents race conditions
   private messageQueue: (ArrayBuffer | string)[] = [];
   private processingMessage = false;
+  private writeQueue = new ParallelTaskQueue(32); // Concurrency 32 for maximum SSD saturation
+
+  private getTotalBufferedAmount(): number {
+    return this.dataChannels.reduce((sum, c) => sum + (c?.bufferedAmount || 0), 0);
+  }
 
   constructor(
     config: RTCConfig = DEFAULT_RTC_CONFIG,
@@ -142,13 +209,13 @@ export class P2PConnection {
     }
   }
 
-  /** Returns a promise that resolves when the data channel is open (or immediately if already open). */
+  /** Returns a promise that resolves when at least one data channel is open. */
   private waitForDataChannel(timeoutMs = 15000): Promise<void> {
-    if (this.dataChannel?.readyState === 'open') return Promise.resolve();
-    console.log(`[P2P] Waiting for data channel to open with ${this.remotePeerId}... (current: ${this.dataChannel?.readyState || 'none'})`);
+    if (this.dataChannels.some(c => c.readyState === 'open')) return Promise.resolve();
+    console.log(`[P2P] Waiting for data channel to open with ${this.remotePeerId}...`);
     return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
-        reject(new Error(`Timed out waiting for data channel (${this.dataChannel?.readyState || 'none'})`));
+        reject(new Error('Timed out waiting for data channel'));
       }, timeoutMs);
       this.channelReadyResolvers.push({
         resolve: () => {
@@ -174,7 +241,7 @@ export class P2PConnection {
     // PROACTIVE CHECK: Set initial states based on current PC state
     if (this.pc.connectionState === 'connected') {
       this.pcConnected = true;
-      if (this.dataChannel?.readyState === 'open') {
+      if (this.dataChannels.some(c => c.readyState === 'open')) {
         this.channelOpen = true;
       }
       this.checkFullyConnected('proactive-pc');
@@ -186,7 +253,7 @@ export class P2PConnection {
       if (state === 'connected') {
         this.pcConnected = true;
         // Check if data channel is also ready. If not, we wait for onopen.
-        if (this.dataChannel?.readyState === 'open') {
+        if (this.dataChannels.some(c => c.readyState === 'open')) {
           this.channelOpen = true;
         }
         this.checkFullyConnected('pc');
@@ -204,7 +271,7 @@ export class P2PConnection {
       console.log(`[P2P] ICE connection state for ${this.remotePeerId}: ${iceState}`);
       if (iceState === 'connected' || iceState === 'completed') {
         this.pcConnected = true;
-        if (this.dataChannel?.readyState === 'open') {
+        if (this.dataChannels.some(c => c.readyState === 'open')) {
           this.channelOpen = true;
         }
         this.checkFullyConnected('ice');
@@ -222,17 +289,20 @@ export class P2PConnection {
   }
 
   private setupDataChannel(channel: RTCDataChannel) {
-    this.dataChannel = channel;
+    if (this.dataChannels.includes(channel)) return;
+    this.dataChannels.push(channel);
     channel.binaryType = 'arraybuffer';
 
     channel.onopen = () => {
-      console.log(`[P2P] Data channel OPEN with ${this.remotePeerId}. PC State: ${this.pc.connectionState}`);
+      console.log(`[P2P] Data channel OPEN [${channel.label}] with ${this.remotePeerId}. PC State: ${this.pc.connectionState}`);
       this.channelOpen = true;
       
       // Resolve any pending waitForDataChannel promises
       const resolvers = this.channelReadyResolvers.splice(0);
-      console.log(`[P2P] Resolving ${resolvers.length} pending channel waiters for ${this.remotePeerId}`);
-      resolvers.forEach(r => r.resolve());
+      if (resolvers.length > 0) {
+        console.log(`[P2P] Resolving ${resolvers.length} pending channel waiters for ${this.remotePeerId}`);
+        resolvers.forEach(r => r.resolve());
+      }
       
       this.drainControlQueue();
       this.checkFullyConnected('channel');
@@ -246,31 +316,46 @@ export class P2PConnection {
     };
 
     channel.onclose = () => {
-      this.channelOpen = false;
-      this.connectedEmitted = false;
-      
-      const resolvers = this.channelReadyResolvers.splice(0);
-      resolvers.forEach(r => r.reject(new Error('Data channel closed before opening')));
-      
-      this.emit('disconnected', { channelClosed: true });
+      console.log(`[P2P] Data channel CLOSED [${channel.label}] for ${this.remotePeerId}`);
+      this.dataChannels = this.dataChannels.filter(c => c !== channel);
+      if (this.dataChannels.length === 0) {
+        this.channelOpen = false;
+        this.connectedEmitted = false;
+        const resolvers = this.channelReadyResolvers.splice(0);
+        resolvers.forEach(r => r.reject(new Error('All data channels closed')));
+        this.emit('disconnected', { channelClosed: true });
+      }
     };
 
     channel.onerror = (e: any) => {
       const errorDetail = e.error?.message || e.error?.name || e.message || (typeof e.error === 'string' ? e.error : null) || 'Unknown data channel error';
-      console.error(`[P2P] Data channel error for ${this.remotePeerId}:`, errorDetail, e);
+      console.error(`[P2P] Data channel error [${channel.label}] for ${this.remotePeerId}:`, errorDetail);
       
-      const resolvers = this.channelReadyResolvers.splice(0);
-      resolvers.forEach(r => r.reject(new Error(`Data channel error: ${errorDetail}`)));
+      // AIMD: Decrease buffer limit on error
+      this.adaptiveMaxBuffer = Math.max(MAX_BUFFERED_AMOUNT, this.adaptiveMaxBuffer / 2);
+      this.adaptiveThreshold = Math.max(BUFFER_THRESHOLD, this.adaptiveMaxBuffer / 2);
+      console.log(`[P2P] Adaptive throttle: limits reduced to ${formatBytes(this.adaptiveMaxBuffer)}`);
       
-      this.emit('error', errorDetail);
+      if (this.dataChannels.length <= 1) {
+        const resolvers = this.channelReadyResolvers.splice(0);
+        resolvers.forEach(r => r.reject(new Error(`Data channel error: ${errorDetail}`)));
+        this.emit('error', errorDetail);
+      }
     };
 
     channel.onmessage = (e) => {
       this.enqueueMessage(e.data);
     };
 
-    channel.bufferedAmountLowThreshold = BUFFER_THRESHOLD;
+    channel.bufferedAmountLowThreshold = this.adaptiveThreshold;
     channel.onbufferedamountlow = () => {
+      // AIMD: Increase buffer limit moderately on success
+      if (this.adaptiveMaxBuffer < 64 * 1024 * 1024) { // Cap at 64MB
+        this.adaptiveMaxBuffer += 512 * 1024; // Add 512KB (safer ramp-up)
+        this.adaptiveThreshold = this.adaptiveMaxBuffer / 2;
+        channel.bufferedAmountLowThreshold = this.adaptiveThreshold;
+      }
+
       if (this.sendPaused && this.currentSendFile) {
         this.sendPaused = false;
         this.sendNextChunks();
@@ -279,7 +364,7 @@ export class P2PConnection {
 
     // PROACTIVE CHECK: If the channel is already open, trigger the logic immediately
     if (channel.readyState === 'open') {
-      console.log(`[P2P] Data channel was ALREADY open with ${this.remotePeerId}`);
+      console.log(`[P2P] Data channel [${channel.label}] was ALREADY open with ${this.remotePeerId}`);
       this.channelOpen = true;
       this.drainControlQueue();
       this.checkFullyConnected('proactive-channel');
@@ -317,26 +402,52 @@ export class P2PConnection {
       return;
     }
 
-    // Binary data — reconstruct with header
+    // ZERO-COPY PARSING: Use views instead of slices
     const view = new DataView(data);
     const idLen = view.getUint32(0, true);
-    const idBytes = new Uint8Array(data, 4, idLen);
-    const fileId = new TextDecoder().decode(idBytes);
-    const chunkIndex = view.getUint32(4 + idLen, true);
-    const chunk = data.slice(4 + idLen + 4);
-
-    const stream = this.writableStreams.get(fileId);
-    if (stream) {
-      await stream.write({ type: 'write', position: chunkIndex * CHUNK_SIZE, data: chunk });
-    } else {
-      const buffers = this.receiveBuffers.get(fileId) || [];
-      buffers[chunkIndex] = chunk;
-      this.receiveBuffers.set(fileId, buffers);
+    
+    // Cache check for fileId decoding (using views avoids copies)
+    const idView = new Uint8Array(data, 4, idLen);
+    const idKey = idLen + '_' + idView[0] + '_' + idView[idLen - 1]; // Simple fast key
+    let fileId = this.fileIdDecoderCache.get(idKey);
+    if (!fileId) {
+      fileId = this.fileIdDecoder.decode(idView);
+      this.fileIdDecoderCache.set(idKey, fileId);
     }
+    
+    const chunkIndex = view.getUint32(4 + idLen, true);
+    // Use subarray instead of slice to avoid copying memory
+    const chunkView = new Uint8Array(data, 4 + idLen + 4);
+
+    // RECEIVER BACKPRESSURE: Monitor writeQueue depth to prevent memory exhaustion
+    if (this.writeQueue.pending > 64 && !this.receiverPaused) {
+      console.warn(`[P2P] Receiver write queue heavy (${this.writeQueue.pending} chunks), triggering backpressure...`);
+      this.receiverPaused = true;
+      this.send(JSON.stringify({ type: 'pause', fileId: '' }));
+    }
+
+    // DECOUPLED DISK WRITE: We run this in parallel task queue to avoid blocking message processing loop
+    this.writeQueue.run(async () => {
+      const stream = this.writableStreams.get(fileId!);
+      if (stream) {
+        await stream.write({ type: 'write', position: chunkIndex * CHUNK_SIZE, data: chunkView });
+      } else {
+        const buffers = this.receiveBuffers.get(fileId!) || [];
+        buffers[chunkIndex] = chunkView.buffer.slice(chunkView.byteOffset, chunkView.byteOffset + chunkView.byteLength);
+        this.receiveBuffers.set(fileId!, buffers);
+      }
+
+      // Check if we can resume sender
+      if (this.receiverPaused && this.writeQueue.pending < 16) {
+        console.log(`[P2P] Receiver write queue drained (${this.writeQueue.pending} chunks), resuming sender...`);
+        this.receiverPaused = false;
+        this.send(JSON.stringify({ type: 'resume', fileId: '' }));
+      }
+    });
 
     const meta = this.receiveMetas.get(fileId);
     if (meta) {
-      const received = (this.receiveProgress.get(fileId) || 0) + chunk.byteLength;
+      const received = (this.receiveProgress.get(fileId) || 0) + chunkView.byteLength;
       this.receiveProgress.set(fileId, received);
 
       let stats = this.receiveStats.get(fileId);
@@ -353,18 +464,22 @@ export class P2PConnection {
         stats.lastSpeedCalc = now;
       }
 
-      const progress: TransferProgress = {
-        fileId,
-        fileName: meta.name,
-        totalSize: meta.size,
-        transferredBytes: received,
-        percentage: Math.min(100, (received / meta.size) * 100),
-        speed: stats.currentSpeed,
-        eta: stats.currentSpeed > 0 ? (meta.size - received) / stats.currentSpeed : 0,
-        status: 'transferring',
-        fileType: meta.type,
-      };
-      this.emit('progress', progress);
+      // Throttle UI progress events
+      if (now - (this.lastProgressEmit || 0) > 100) {
+        const progress: TransferProgress = {
+          fileId,
+          fileName: meta.name,
+          totalSize: meta.size,
+          transferredBytes: received,
+          percentage: Math.min(100, (received / meta.size) * 100),
+          speed: stats.currentSpeed,
+          eta: stats.currentSpeed > 0 ? (meta.size - received) / stats.currentSpeed : 0,
+          status: 'transferring',
+          fileType: meta.type,
+        };
+        this.emit('progress', progress);
+        this.lastProgressEmit = now; 
+      }
     }
   }
 
@@ -466,6 +581,9 @@ export class P2PConnection {
           this.receiveMetas.clear();
           this.receiveProgress.clear();
           this.receiveStats.clear();
+          this.fileIdDecoderCache.clear();
+          this.receiverPaused = false;
+          this.writeQueue = new ParallelTaskQueue(32);
           this.emit('disconnected', { cancelled: true });
         }
         break;
@@ -533,11 +651,13 @@ export class P2PConnection {
   }
 
   async createOffer(): Promise<RTCSessionDescriptionInit> {
-    console.log(`[P2P] Creating offer for ${this.remotePeerId}`);
-    this.dataChannel = this.pc.createDataChannel('file-transfer', {
-      ordered: true,
-    });
-    this.setupDataChannel(this.dataChannel);
+    console.log(`[P2P] Creating offer for ${this.remotePeerId} with ${this.numChannels} channels`);
+    for (let i = 0; i < this.numChannels; i++) {
+      const channel = this.pc.createDataChannel(`file-transfer-${i}`, {
+        ordered: true,
+      });
+      this.setupDataChannel(channel);
+    }
 
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
@@ -746,12 +866,20 @@ export class P2PConnection {
     this.currentSendFile = null;
     this.currentSendMeta = null;
     this.isSending = false;
+    this.readAheadQueue = []; // Clear memory!
+    this.fileIdDecoderCache.clear(); // Clear decoder cache
+    this.receiverPaused = false;
+    // No direct way to "clear" ParallelTaskQueue, but resetting the instance works for cleanup
+    this.writeQueue = new ParallelTaskQueue(32); 
   }
 
   private async sendNextChunks() {
-    if (!this.currentSendFile || !this.currentSendMeta || !this.dataChannel) return;
+    if (!this.currentSendFile || !this.currentSendMeta || this.dataChannels.length === 0) return;
     if (this.sendPaused || this.isSending) return;
-    if (this.dataChannel.readyState !== 'open') return;
+    
+    // Check if at least one channel is open
+    const openChannels = this.dataChannels.filter(c => c.readyState === 'open');
+    if (openChannels.length === 0) return;
 
     this.isSending = true;
     const file = this.currentSendFile;
@@ -760,29 +888,81 @@ export class P2PConnection {
     let chunkIndex = Math.floor(this.totalSent / CHUNK_SIZE);
     let loopStart = Date.now();
 
+    // BACKGROUND READER: Pre-reads chunks into memory
+    const fillReadAhead = async () => {
+      let readIndex = chunkIndex;
+      while (this.isSending && readIndex < totalChunks) {
+        if (this.readAheadQueue.length >= 20) { // Keep 20 chunks (~5MB) in memory
+          await new Promise(resolve => setTimeout(resolve, 50));
+          continue;
+        }
+        
+        try {
+          const start = readIndex * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, file.size);
+          const buffer = await file.slice(start, end).arrayBuffer();
+          this.readAheadQueue.push({ index: readIndex, buffer });
+          readIndex++;
+        } catch (err) {
+          console.error('[P2P] Read-ahead failure:', err);
+          break;
+        }
+      }
+    };
+    fillReadAhead(); // intentionally not awaited
+
     while (chunkIndex < totalChunks) {
       if (this.sendPaused || !this.isSending) {
         this.isSending = false;
         return;
       }
 
-      if (this.dataChannel?.readyState !== 'open') {
-        console.warn('[P2P] Channel closed during send loop');
+      // GLOBAL BACKPRESSURE: If the shared SCTP association is nearly full, pause
+      const totalBuffered = this.getTotalBufferedAmount();
+      if (totalBuffered >= GLOBAL_MAX_BUFFER) {
+        console.warn(`[P2P] Global SCTP buffer threshold hit (${formatBytes(totalBuffered)}), backing off...`);
+        this.sendPaused = true;
         this.isSending = false;
+        // Wait for onbufferedamountlow on any channel to resume
         return;
       }
 
-      if (this.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+      // Round-robin selection of an open channel that isn't full
+      let channel: RTCDataChannel | null = null;
+      const channelCount = this.dataChannels.length;
+      if (channelCount === 0) {
         this.sendPaused = true;
         this.isSending = false;
         return;
       }
 
-      try {
-        const start = chunkIndex * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, file.size);
-        const sliceBuffer = await file.slice(start, end).arrayBuffer();
+      for (let i = 0; i < channelCount; i++) {
+        const potential = this.dataChannels[this.currentChannelIndex];
+        this.currentChannelIndex = (this.currentChannelIndex + 1) % channelCount;
+        
+        if (potential && potential.readyState === 'open' && potential.bufferedAmount <= this.adaptiveMaxBuffer) {
+          channel = potential;
+          break;
+        }
+      }
 
+      // If no channels are available for sending (all full or closed), pause and wait
+      if (!channel) {
+        // Randomized short delay before re-testing
+        await new Promise(resolve => setTimeout(resolve, 10 + Math.random() * 40));
+        continue;
+      }
+
+      // PULL FROM MEMORY: Pull the next chunk from the read-ahead queue
+      const nextIdx = this.readAheadQueue.findIndex(item => item.index === chunkIndex);
+      if (nextIdx === -1) {
+        // Queue empty, wait a bit for background reader
+        await new Promise(resolve => setTimeout(resolve, 20));
+        continue;
+      }
+      const { buffer: sliceBuffer } = this.readAheadQueue.splice(nextIdx, 1)[0];
+
+      try {
         const idBytes = new TextEncoder().encode(meta.id);
         const header = new ArrayBuffer(4 + idBytes.length + 4);
         const headerView = new DataView(header);
@@ -794,25 +974,22 @@ export class P2PConnection {
         combined.set(new Uint8Array(header), 0);
         combined.set(new Uint8Array(sliceBuffer), header.byteLength);
 
-        // check again post-await
-        if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
-          console.warn('[P2P] Data channel not open right before send');
-          this.isSending = false;
-          return;
+        // check again
+        if (channel.readyState !== 'open') {
+          this.readAheadQueue.unshift({ index: chunkIndex, buffer: sliceBuffer }); // put back
+          continue; 
         }
 
         try {
-          if (this.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-            console.warn('[P2P] Buffer overflow right before send, pausing...');
-            this.sendPaused = true;
-            this.isSending = false;
-            return;
+          if (channel.bufferedAmount > this.adaptiveMaxBuffer) {
+            this.readAheadQueue.unshift({ index: chunkIndex, buffer: sliceBuffer }); // put back
+            continue; 
           }
-          this.dataChannel.send(combined.buffer);
+          channel.send(combined.buffer);
         } catch (e: any) {
           const errMsg = e.message || e.toString() || '';
           if (e.name === 'OperationError' || /full/i.test(errMsg) || /queue/i.test(errMsg)) {
-            console.warn('[P2P] Send queue full handled, pausing...');
+            this.readAheadQueue.unshift({ index: chunkIndex, buffer: sliceBuffer }); // put back
             this.sendPaused = true;
             this.isSending = false;
             return;
@@ -900,12 +1077,13 @@ export class P2PConnection {
   private controlQueue: string[] = [];
 
   private drainControlQueue() {
-    if (this.dataChannel?.readyState === 'open') {
+    const channel = this.dataChannels.find(c => c.readyState === 'open');
+    if (channel) {
       while (this.controlQueue.length > 0) {
         const queued = this.controlQueue.shift();
         if (queued) {
           console.log(`[P2P] Sending queued control message to ${this.remotePeerId}`);
-          this.dataChannel.send(queued);
+          channel.send(queued);
         }
       }
     }
@@ -913,10 +1091,12 @@ export class P2PConnection {
 
   private send(data: string) {
     this.drainControlQueue();
-    if (this.dataChannel?.readyState === 'open') {
-      this.dataChannel.send(data);
+    // Use the first available open channel for control messages
+    const channel = this.dataChannels.find(c => c.readyState === 'open');
+    if (channel) {
+      channel.send(data);
     } else {
-      console.log(`[P2P] Queuing control message for ${this.remotePeerId} (state: ${this.dataChannel?.readyState})`);
+      console.log(`[P2P] Queuing control message for ${this.remotePeerId} (no open channels)`);
       this.controlQueue.push(data);
     }
   }
@@ -951,7 +1131,8 @@ export class P2PConnection {
     const resolvers = this.channelReadyResolvers.splice(0);
     resolvers.forEach(r => r.reject(new Error('Connection closed manually')));
 
-    this.dataChannel?.close();
+    this.dataChannels.forEach(c => c.close());
+    this.dataChannels = [];
     this.pc.close();
   }
 
