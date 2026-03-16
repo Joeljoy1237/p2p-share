@@ -340,19 +340,15 @@ export default function SendPage() {
 
                 <div className="max-h-[400px] overflow-y-auto">
                   <AnimatePresence>
-                    {files.map((file, i) => {
-                      const transferId = [...transfers.values()].find(
-                        (t) => t.fileName === file.name
-                      );
-                      return (
-                        <FileRow
-                          key={`${file.name}-${i}`}
-                          file={file}
-                          transfer={transferId}
-                          onRemove={() => removeFile(i)}
-                        />
-                      );
-                    })}
+                    {files.map((file, i) => (
+                      <FileRow
+                        key={`${file.name}-${i}`}
+                        file={file}
+                        transfers={transfers}
+                        peerCount={connectedPeers.length}
+                        onRemove={() => removeFile(i)}
+                      />
+                    ))}
                   </AnimatePresence>
                 </div>
 
@@ -553,13 +549,31 @@ function ConnectionBadge({ status, peers }: { status: string; peers: number }) {
 
 function FileRow({
   file,
-  transfer,
+  transfers,
+  peerCount,
   onRemove,
 }: {
   file: File;
-  transfer?: { percentage: number; speed: number; eta: number; status: string } | undefined;
+  transfers: Map<string, any>;
+  peerCount: number;
   onRemove: () => void;
 }) {
+  // Find all transfers related to this file name
+  const fileTransfers = [...transfers.values()].filter(t => t.fileName === file.name);
+  
+  // Aggregate status
+  const isTransferring = fileTransfers.some(t => t.status === 'transferring');
+  const allCompleted = fileTransfers.length >= peerCount && fileTransfers.every(t => t.status === 'completed');
+  
+  // Best progress to show: minimum percentage (worst case) or just the first active one
+  const avgPercentage = fileTransfers.length > 0 
+    ? fileTransfers.reduce((acc, t) => acc + t.percentage, 0) / fileTransfers.length
+    : 0;
+    
+  // Format info
+  const speed = fileTransfers.reduce((acc, t) => acc + (t.speed || 0), 0);
+  const eta = fileTransfers.length > 0 ? Math.max(...fileTransfers.map(t => t.eta || 0)) : 0;
+
   return (
     <motion.div
       initial={{ opacity: 0, x: -10 }}
@@ -577,22 +591,22 @@ function FileRow({
           <span>{formatBytes(file.size)}</span>
           <span className="opacity-30">•</span>
           <span className="uppercase">{getFileExtension(file.name)}</span>
-          {transfer && transfer.status === 'transferring' && (
+          {isTransferring && (
             <>
               <span className="opacity-30">•</span>
-              <span className="text-accent font-medium">{formatSpeed(transfer.speed)}</span>
+              <span className="text-accent font-medium">{formatSpeed(speed)} total</span>
               <span className="opacity-30">•</span>
-              <span>{formatETA(transfer.eta)} left</span>
+              <span>{formatETA(eta)} left</span>
             </>
           )}
         </div>
 
-        {transfer && (
+        {fileTransfers.length > 0 && (
           <div className="mt-2.5">
             <div className="progress-track h-1.5">
               <motion.div
                 className="progress-fill h-full"
-                animate={{ width: `${transfer.percentage}%` }}
+                animate={{ width: `${avgPercentage}%` }}
                 transition={{ type: "spring", bounce: 0, duration: 0.5 }}
               />
             </div>
@@ -600,8 +614,12 @@ function FileRow({
         )}
       </div>
 
-      {transfer?.status === 'completed' ? (
-        <span className="tag tag-green shrink-0 flex items-center gap-1"><Check className="w-3 h-3" /> Sent</span>
+      {allCompleted ? (
+        <span className="tag tag-green shrink-0 flex items-center gap-1"><Check className="w-3 h-3" /> Sent to All</span>
+      ) : isTransferring ? (
+        <span className="tag tag-blue shrink-0 flex items-center gap-1">
+          {fileTransfers.length}/{peerCount}
+        </span>
       ) : (
         <button
           onClick={onRemove}

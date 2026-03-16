@@ -8,9 +8,9 @@ import type {
   RTCConfig,
 } from '@/types';
 
-const CHUNK_SIZE = 256 * 1024; // 256KB chunks (optimal high bandwidth size)
-const MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024; // 16MB buffer limit for high throughput
-const BUFFER_THRESHOLD = 8 * 1024 * 1024; // 8MB threshold before resuming pipeline
+const CHUNK_SIZE = 64 * 1024; // 64KB chunks (more compatible, smaller bursts)
+const MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1MB buffer limit for stability
+const BUFFER_THRESHOLD = 512 * 1024; // 512KB threshold before resuming pipeline
 
 export const DEFAULT_RTC_CONFIG: RTCConfig = {
   iceServers: [
@@ -624,7 +624,7 @@ export class P2PConnection {
   }
 
   sendFiles(files: File[]) {
-    // Deduplicate against active file AND current queue
+    // Deduplicate against active file, current queue, AND already completed files
     const filtered = files.filter(f => {
       const activeMeta = this.currentSendMeta;
       const isSending = activeMeta && 
@@ -635,14 +635,19 @@ export class P2PConnection {
         q.name === f.name && q.size === f.size
       );
 
-      if (isSending || inQueue) {
-        console.warn(`[P2P] Skipping duplicate file already in process: ${f.name}`);
+      const isCompleted = this.completedFiles.has(`${f.name}-${f.size}`);
+
+      if (isSending || inQueue || isCompleted) {
+        console.warn(`[P2P] Skipping duplicate/completed file: ${f.name}`);
         return false;
       }
       return true;
     });
 
-    if (filtered.length === 0) return;
+    if (filtered.length === 0) {
+      console.log(`[P2P] All files are already in queue or completed for ${this.remotePeerId}`);
+      return;
+    }
 
     this.sendQueue.push(...filtered);
     if (!this.currentSendFile) {
@@ -791,11 +796,18 @@ export class P2PConnection {
 
         // check again post-await
         if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+          console.warn('[P2P] Data channel not open right before send');
           this.isSending = false;
           return;
         }
 
         try {
+          if (this.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+            console.warn('[P2P] Buffer overflow right before send, pausing...');
+            this.sendPaused = true;
+            this.isSending = false;
+            return;
+          }
           this.dataChannel.send(combined.buffer);
         } catch (e: any) {
           const errMsg = e.message || e.toString() || '';
