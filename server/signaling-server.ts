@@ -286,6 +286,17 @@ io.on('connection', (socket: Socket) => {
     });
   });
 
+  // Health check
+  socket.on('ping', (callback: (response: any) => void) => {
+    callback({
+      success: true,
+      status: 'alive',
+      time: Date.now(),
+      rooms: rooms.size / 2, // Divided by 2 because we index by both ID and code
+      uptime: process.uptime(),
+    });
+  });
+
   // Handle disconnect
   socket.on('disconnect', () => {
     const roomId = peerToRoom.get(socket.id);

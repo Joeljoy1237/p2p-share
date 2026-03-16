@@ -4,6 +4,7 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import { useSignaling } from '@/lib/use-signaling';
 import { formatBytes, formatSpeed, formatETA, getFileIcon, getFileExtension, generateShareUrl, generateQRCode } from '@/lib/utils';
+import ServerStatus from '@/components/ServerStatus';
 
 export default function SendPage() {
   const [files, setFiles] = useState<File[]>([]);
@@ -137,13 +138,16 @@ export default function SendPage() {
           </span>
         </Link>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <ConnectionBadge status={status} peers={connectedPeers.length} />
-          {isInRoom && (
-            <button onClick={leaveRoom} className="btn btn-ghost" style={{ fontSize: 13 }}>
-              Leave Room
-            </button>
-          )}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <ServerStatus />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <ConnectionBadge status={status} peers={connectedPeers.length} />
+            {isInRoom && (
+              <button onClick={leaveRoom} className="btn btn-ghost" style={{ fontSize: 13 }}>
+                Leave Room
+              </button>
+            )}
+          </div>
         </div>
       </header>
 

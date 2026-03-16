@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
+import ServerStatus from '@/components/ServerStatus';
 
 export default function Home() {
   const router = useRouter();
@@ -65,13 +66,16 @@ export default function Home() {
             </span>
           </div>
 
-          <div style={{ display: 'flex', gap: 8 }}>
-            <Link href="/send" className="btn btn-ghost" style={{ textDecoration: 'none' }}>
-              Send Files
-            </Link>
-            <Link href="/receive" className="btn btn-primary" style={{ textDecoration: 'none' }}>
-              Receive Files
-            </Link>
+          <div style={{ display: 'flex', gap: 16, alignItems: 'center' }}>
+            <ServerStatus />
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Link href="/send" className="btn btn-ghost" style={{ textDecoration: 'none' }}>
+                Send Files
+              </Link>
+              <Link href="/receive" className="btn btn-primary" style={{ textDecoration: 'none' }}>
+                Receive Files
+              </Link>
+            </div>
           </div>
         </nav>
 

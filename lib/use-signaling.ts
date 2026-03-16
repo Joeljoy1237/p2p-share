@@ -34,6 +34,7 @@ export interface UseSignalingReturn {
   pauseTransfer: () => void;
   resumeTransfer: () => void;
   cancelTransfer: () => void;
+  checkServerHealth: () => Promise<{ alive: boolean; stats?: any }>;
   onFileStart?: (peerId: string, fileId: string, metadata: FileMetadata) => void;
   error: string | null;
 }
@@ -431,6 +432,29 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
     });
   }, []);
 
+  const checkServerHealth = async (): Promise<{ alive: boolean; stats?: any }> => {
+    return new Promise((resolve) => {
+      const s = globalThis.__signaling_socket;
+      if (!s || !s.connected) {
+        resolve({ alive: false });
+        return;
+      }
+
+      const timeout = setTimeout(() => {
+        resolve({ alive: false });
+      }, 3000);
+
+      s.emit('ping', (response: any) => {
+        clearTimeout(timeout);
+        if (response && response.success) {
+          resolve({ alive: true, stats: response });
+        } else {
+          resolve({ alive: false });
+        }
+      });
+    });
+  };
+
   return {
     status,
     room,
@@ -447,6 +471,7 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
     pauseTransfer,
     resumeTransfer,
     cancelTransfer,
+    checkServerHealth,
     error,
   };
 }

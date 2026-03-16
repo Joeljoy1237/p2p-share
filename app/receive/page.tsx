@@ -6,6 +6,7 @@ import { useSearchParams } from 'next/navigation';
 import { useSignaling } from '@/lib/use-signaling';
 import { formatBytes, formatSpeed, formatETA, getFileIcon, formatDuration } from '@/lib/utils';
 import type { ReceivedFile } from '@/lib/use-signaling';
+import ServerStatus from '@/components/ServerStatus';
 
 function ReceiveContent() {
   const searchParams = useSearchParams();
@@ -264,20 +265,23 @@ function ReceiveContent() {
           </span>
         </Link>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <div className={`status-dot ${isInRoom ? 'connected' : 'disconnected'}`} />
-            <span style={{ fontSize: 13, color: 'var(--text-2)' }}>
-              {isInRoom
-                ? `Room ${room.code} · ${connectedPeers.length} sender${connectedPeers.length !== 1 ? 's' : ''}`
-                : 'Not connected'}
-            </span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <ServerStatus />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div className={`status-dot ${isInRoom ? 'connected' : 'disconnected'}`} />
+              <span style={{ fontSize: 13, color: 'var(--text-2)' }}>
+                {isInRoom
+                  ? `Room ${room.code} · ${connectedPeers.length} sender${connectedPeers.length !== 1 ? 's' : ''}`
+                  : 'Not connected'}
+              </span>
+            </div>
+            {isInRoom && (
+              <button onClick={leaveRoom} className="btn btn-ghost" style={{ fontSize: 13 }}>
+                Leave
+              </button>
+            )}
           </div>
-          {isInRoom && (
-            <button onClick={leaveRoom} className="btn btn-ghost" style={{ fontSize: 13 }}>
-              Leave
-            </button>
-          )}
         </div>
       </header>
 
