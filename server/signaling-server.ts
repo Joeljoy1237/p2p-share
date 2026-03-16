@@ -35,6 +35,7 @@ interface Room {
 // In-memory room store (use Redis for production)
 const rooms = new Map<string, Room>();
 const peerToRoom = new Map<string, string>();
+const emptyRoomTimeouts = new Map<string, NodeJS.Timeout>();
 
 function createRoom(options: RoomOptions = {}): Room {
   const roomId = uuidv4();
@@ -151,8 +152,9 @@ io.on('connection', (socket: Socket) => {
       return callback({ success: false, error: 'Room details required' });
     }
 
-    const sanitizedIdOrCode = String(roomIdOrCode).toUpperCase().trim().slice(0, 50);
-    let room = rooms.get(sanitizedIdOrCode);
+    const input = String(roomIdOrCode).trim();
+    // Try code (uppercase) first, then original (for UUIDs)
+    let room = rooms.get(input.toUpperCase()) || rooms.get(input);
 
     if (!room) {
       return callback({ success: false, error: 'Room not found' });
@@ -170,6 +172,23 @@ io.on('connection', (socket: Socket) => {
 
     if (room.isPasswordProtected && room.password !== password) {
       return callback({ success: false, error: 'Invalid password' });
+    }
+
+    // Check if we are already in this room to avoid double-join logic
+    if (room.peers.has(socket.id)) {
+      console.log(`[ROOM] ${socket.id} already in room ${room.code}, ignoring redundant join.`);
+      return callback({
+        success: true,
+        room: getRoomInfo(room),
+        existingPeers: [...room.peers.keys()].filter((id) => id !== socket.id),
+      });
+    }
+
+    // Cancel any pending cleanup timeout
+    if (emptyRoomTimeouts.has(room.id)) {
+      clearTimeout(emptyRoomTimeouts.get(room.id)!);
+      emptyRoomTimeouts.delete(room.id);
+      console.log(`[ROOM] Cancelled cleanup for ${room.code} (peer re-joined)`);
     }
 
     socket.join(room.id);
@@ -309,11 +328,19 @@ io.on('connection', (socket: Socket) => {
           peerCount: room.peers.size,
         });
 
-        // Remove empty rooms
+        // Remove empty rooms after a grace period
         if (room.peers.size === 0) {
-          rooms.delete(room.id);
-          rooms.delete(room.code);
-          console.log(`[ROOM] Removed empty room: ${room.code}`);
+          console.log(`[ROOM] Room ${room.code} is empty, starting 30s grace period...`);
+          const timeout = setTimeout(() => {
+            const currentRoom = rooms.get(room.id);
+            if (currentRoom && currentRoom.peers.size === 0) {
+              rooms.delete(room.id);
+              rooms.delete(room.code);
+              emptyRoomTimeouts.delete(room.id);
+              console.log(`[ROOM] Cleanup complete: Removed empty room ${room.code}`);
+            }
+          }, 30000); // 30 seconds grace period
+          emptyRoomTimeouts.set(room.id, timeout);
         }
       }
       peerToRoom.delete(socket.id);
@@ -321,6 +348,15 @@ io.on('connection', (socket: Socket) => {
 
     console.log(`[-] Client disconnected: ${socket.id}`);
   });
+});
+
+// Error handlers to prevent server crash
+process.on('uncaughtException', (err) => {
+  console.error('[SERVER] Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[SERVER] Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
 httpServer.listen(PORT, () => {

@@ -50,6 +50,7 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [room, setRoom] = useState<Room | null>(null);
   const [myPeerId, setMyPeerId] = useState('');
+  const [lastSocketId, setLastSocketId] = useState('');
   const [connectedPeers, setConnectedPeers] = useState<string[]>([]);
   const [pendingPeers, setPendingPeers] = useState<string[]>([]); // New: track peers in handshake
   const [transfers, setTransfers] = useState<Map<string, TransferProgress>>(new Map());
@@ -58,6 +59,7 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
   const roomRef = useRef<Room | null>(null);
   const passwordRef = useRef<string>('');
   const connectedPeersRef = useRef<string[]>([]);
+  const statusRef = useRef<ConnectionStatus>('disconnected');
 
   // Keep connectedPeers ref in sync
   useEffect(() => {
@@ -68,6 +70,11 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
   useEffect(() => {
     roomRef.current = room;
   }, [room]);
+
+  // Keep status ref in sync
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
 
   // Keep options stable without triggering re-renders
   useEffect(() => {
@@ -83,31 +90,68 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
     }
 
     console.log(`[SIGNALING] Creating connection to ${peerId}. Initiator: ${isInitiator}. My ID: ${myId}`);
-    setPendingPeers(prev => [...new Set([...prev, peerId])]);
-
+    
     const conn = new P2PConnection(DEFAULT_RTC_CONFIG, myId, peerId);
+    // CRITICAL: Set immediately to prevent race conditions during React's double-mount
+    connectionsRef.current.set(peerId, conn);
+    
+    setPendingPeers(prev => [...new Set([...prev, peerId])]);
     
     // Watchdog to cleanup if connection never establishes
+    // Increased to 45s to handle slow STUN/TURN gathering and relay paths
     const watchdog = setTimeout(() => {
-      if (connectionsRef.current.get(peerId) === conn && connectedPeersRef.current.indexOf(peerId) === -1) {
-        console.warn(`[SIGNALING] Connection watchdog timed out for ${peerId}`);
+      const currentConn = connectionsRef.current.get(peerId);
+      const state = conn.getConnectionState();
+      
+      // Only fire watchdog if THIS connection instance is still the active one
+      // AND it's not actually connected.
+      if (currentConn === conn && state !== 'connected') {
+        console.warn(`[SIGNALING] Connection watchdog timed out for ${peerId} after 45s. Current state: ${state}`);
         setPendingPeers(prev => prev.filter(id => id !== peerId));
-        setError(`Connection timeout with ${peerId.slice(0, 4)}. Check network/firewall.`);
+        setError(`Connection timeout with ${peerId.slice(0, 4)}. check network.`);
         conn.close();
         connectionsRef.current.delete(peerId);
+        setConnectedPeers(prev => prev.filter(id => id !== peerId));
       }
-    }, 15000);
+    }, 45000);
 
     conn.on('file-start', (data) => {
       const { fileId, metadata } = data as { fileId: string; metadata: FileMetadata };
+      
+      // Ensure the file is in our transfers map immediately
+      setTransfers((prev) => {
+        if (prev.has(fileId)) return prev;
+        const next = new Map(prev);
+        next.set(fileId, {
+          fileId,
+          fileName: metadata.name,
+          totalSize: metadata.size,
+          transferredBytes: 0,
+          percentage: 0,
+          speed: 0,
+          eta: 0,
+          status: 'transferring',
+          fileType: metadata.type,
+        });
+        return next;
+      });
+
       optionsRef.current?.onFileStart?.(peerId, fileId, metadata);
     });
 
     conn.on('connected', () => {
       console.log(`[SIGNALING] P2P established with ${peerId}`);
       clearTimeout(watchdog);
-      setPendingPeers(prev => prev.filter(id => id !== peerId));
-      setConnectedPeers((prev) => [...new Set([...prev, peerId])]);
+      setPendingPeers(prev => {
+        const next = prev.filter(id => id !== peerId);
+        console.log(`[SIGNALING] Pending peers updated (connected):`, next);
+        return next;
+      });
+      setConnectedPeers((prev) => {
+        const next = [...new Set([...prev, peerId])];
+        console.log(`[SIGNALING] Connected peers updated:`, next);
+        return next;
+      });
       setStatus('connected');
     });
 
@@ -193,8 +237,6 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
       setConnectedPeers(prev => prev.filter(id => id !== peerId));
     });
 
-    connectionsRef.current.set(peerId, conn);
-
     if (isInitiator) {
       console.log(`[SIGNALING] Initiating connection to ${peerId}...`);
       conn.createOffer().then((offer) => {
@@ -209,7 +251,7 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
     }
 
     return conn;
-  }, []); // Now stable because we use Refs for connectedPeers
+  }, [myPeerId]); // Depend on myPeerId so we use current socket ID
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -226,11 +268,23 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
     const s = globalThis.__signaling_socket;
 
     const onConnect = () => {
-      console.log('[SIGNALING] Socket connected:', s.id);
-      setMyPeerId(s.id || '');
+      const newId = s.id || '';
+      console.log('[SIGNALING] Socket connected:', newId);
+      
+      // If socket ID changed, clear everything - we are effectively a new peer
+      if (lastSocketId && lastSocketId !== newId) {
+        console.warn(`[SIGNALING] Socket ID changed from ${lastSocketId} to ${newId}. Resetting connections.`);
+        connectionsRef.current.forEach(c => c.close());
+        connectionsRef.current.clear();
+        setConnectedPeers([]);
+        setPendingPeers([]);
+      }
+      setLastSocketId(newId);
+      setMyPeerId(newId);
       setError(null);
       
-      if (roomRef.current) {
+      // Only re-join if we have room info but are currently marked as disconnected
+      if (roomRef.current && statusRef.current === 'disconnected') {
         console.log('[SIGNALING] Re-joining room:', roomRef.current.code);
         s.emit('join-room', { 
           roomIdOrCode: roomRef.current.code,
@@ -292,16 +346,10 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
             console.warn(`[SIGNALING] Received answer for unknown connection: ${peerId}`);
           }
         } else if (signal.type === 'ice-candidate') {
-          const conn = connectionsRef.current.get(peerId);
-          if (conn) {
-            if (signal.candidate) {
-              await conn.addIceCandidate(signal.candidate);
-            }
-          } else {
-            // Queue candidates for unknown connections? We use getOrCreate for offers, 
-            // but candidates might arrive before or after specialized glare logic.
-            // For now, let's just log it.
-            console.log(`[SIGNALING] ICE candidate for unknown peer ${peerId}, ignoring.`);
+          // If we don't have a connection yet, create a passive one to queue candidates
+          const conn = connectionsRef.current.get(peerId) || getOrCreateConnection(peerId, false);
+          if (signal.candidate) {
+            await conn.addIceCandidate(signal.candidate);
           }
         }
       } catch (err) {
@@ -374,7 +422,7 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
         passwordRef.current = password || '';
         s.emit(
           'join-room',
-          { roomIdOrCode: roomIdOrCode.toUpperCase().trim(), password },
+          { roomIdOrCode: roomIdOrCode.trim(), password },
           (response: { success: boolean; room: Room; existingPeers: string[]; error?: string }) => {
             if (response.success) {
               setRoom(response.room);
@@ -410,6 +458,9 @@ export function useSignaling(options?: { onFileStart?: (peerId: string, fileId: 
   }, []);
 
   const sendFiles = useCallback((files: File[]) => {
+    if (files.length > 0 && connectionsRef.current.size > 0) {
+      setStatus('transferring');
+    }
     connectionsRef.current.forEach((conn) => {
       conn.sendFiles(files);
     });

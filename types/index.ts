@@ -32,6 +32,7 @@ export interface TransferProgress {
   speed: number; // bytes per second
   eta: number;   // estimated seconds remaining
   status: TransferStatus;
+  fileType?: string;
   error?: string;
 }
 
