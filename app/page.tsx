@@ -69,7 +69,7 @@ export default function Home() {
           <div className="flex items-center gap-3">
             <motion.div
               whileHover={{ scale: 1.05, rotate: 2 }}
-              className="w-10 h-10 bg-gradient-to-br from-accent to-accent-2 rounded-xl flex items-center justify-center shadow-[0_0_20px_var(--color-accent-glow)]"
+              className="w-10 h-10 bg-linear-to-br from-accent to-accent-2 rounded-xl flex items-center justify-center shadow-[0_0_20px_var(--color-accent-glow)]"
             >
               <Zap className="w-5 h-5 text-white" />
             </motion.div>
@@ -105,7 +105,7 @@ export default function Home() {
             className="text-[clamp(40px,6vw,80px)] font-bold leading-[1.05] tracking-tighter mb-7"
           >
             Transfer files<br />
-            <span className="bg-gradient-to-r from-accent via-[#8b5cf6] to-green bg-clip-text text-transparent animate-gradient-shift drop-shadow-[0_0_30px_rgba(91,106,247,0.3)]">
+            <span className="bg-linear-to-r from-accent via-[#8b5cf6] to-green bg-clip-text text-transparent animate-gradient-shift drop-shadow-[0_0_30px_rgba(91,106,247,0.3)]">
               without limits
             </span>
           </motion.h1>
@@ -132,7 +132,7 @@ export default function Home() {
 
             <form onSubmit={handleJoin} className="flex gap-3 w-full sm:w-auto group">
               <input
-                className="input text-center tracking-widest uppercase font-mono !w-[180px]"
+                className="input text-center tracking-widest uppercase font-mono w-[180px]!"
                 placeholder="ROOM CODE"
                 value={joinCode}
                 onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
@@ -187,7 +187,7 @@ export default function Home() {
                 <div key={i} className="flex flex-col md:flex-row items-center gap-6 md:gap-8">
                   {i > 0 && (
                     <div className="flex flex-col items-center gap-1.5 md:rotate-0 rotate-90 my-2 md:my-0">
-                      <div className="w-14 h-0.5 bg-gradient-to-r from-accent to-green rounded-full" />
+                      <div className="w-14 h-0.5 bg-linear-to-r from-accent to-green rounded-full" />
                       <span className="text-[9px] text-text-3 tracking-[0.2em] font-mono uppercase">
                         Encrypted
                       </span>
@@ -316,7 +316,7 @@ function FeatureCard({
       }}
     >
       <Card className="p-7 h-full group cursor-default">
-        <div className={`icon-badge w-14 h-14 bg-gradient-to-br ${colorClass} mb-6 group-hover:scale-105 group-hover:shadow-[0_4px_20px_rgba(0,0,0,0.3)] transition-all duration-300`}>
+        <div className={`icon-badge w-14 h-14 bg-linear-to-br ${colorClass} mb-6 group-hover:scale-105 group-hover:shadow-[0_4px_20px_rgba(0,0,0,0.3)] transition-all duration-300`}>
           {icon}
         </div>
         <h3 className="text-lg font-bold mb-2.5 tracking-tight group-hover:text-accent transition-colors duration-300">

@@ -21,6 +21,7 @@ import {
   FolderOpen
 } from 'lucide-react';
 import { useSignaling } from '@/lib/use-signaling';
+import toast from 'react-hot-toast';
 import { formatBytes, formatSpeed, formatETA, formatDuration, getFileExtension } from '@/lib/utils';
 import type { ReceivedFile } from '@/lib/use-signaling';
 import ServerStatus from '@/components/ServerStatus';
@@ -131,9 +132,11 @@ function ReceiveContent() {
         const fileHandle = await getUniqueFileHandle(rootDirectory, metadata.name);
         const writable = await fileHandle.createWritable();
         signalingRefs.current.setFileStream(peerId, fileId, writable);
+        toast.loading(`Saving ${metadata.name} directly to disk...`, { id: `save-${fileId}` });
         return;
       } catch (err) {
         console.warn('Failed to auto-save to directory, falling back to manual:', err);
+        toast.error('Auto-save failed. Manual selection required.');
       }
     }
 
@@ -159,8 +162,10 @@ function ReceiveContent() {
 
       setRootDirectory(handle);
       setDirectSave(true);
+      toast.success(`Saving to: ${handle.name}`);
     } catch (err) {
       console.error('Directory selection failed:', err);
+      toast.error('Permission denied or folder selection cancelled');
       setDirectSave(false);
     }
   };
@@ -195,6 +200,7 @@ function ReceiveContent() {
       const writable = await handle.createWritable();
 
       setFileStream(pending.peerId, fileId, writable);
+      toast.loading(`Saving ${pending.metadata.name}...`, { id: `save-${fileId}` });
 
       setPendingStreams(prev => {
         const next = new Map(prev);
@@ -205,6 +211,7 @@ function ReceiveContent() {
       resumeTransfer();
     } catch (err) {
       console.error('File save picker cancelled or failed:', err);
+      toast.error('Save location not selected');
       setPendingStreams(prev => {
         const next = new Map(prev);
         next.delete(fileId);
@@ -243,6 +250,7 @@ function ReceiveContent() {
     a.href = file.url;
     a.download = file.metadata.name;
     a.click();
+    toast.success(`Downloading ${file.metadata.name}`);
   };
 
   const downloadAll = () => {
@@ -277,14 +285,14 @@ function ReceiveContent() {
       </div>
 
       {/* Header */}
-      <header className="relative z-10 glass sticky top-0 flex items-center justify-between px-6 md:px-10 py-3.5 border-b border-border border-t-0 border-x-0">
+      <header className="z-10 glass sticky top-0 flex items-center justify-between px-6 md:px-10 py-3.5 border-b border-border border-t-0 border-x-0">
         <div
           onClick={() => router.push('/')}
           className="cursor-pointer flex items-center gap-3"
         >
           <motion.div
             whileHover={{ scale: 1.05, rotate: 2 }}
-            className="w-9 h-9 bg-gradient-to-br from-accent to-accent-2 rounded-[10px] flex items-center justify-center shadow-[0_0_15px_var(--color-accent-glow)]"
+            className="w-9 h-9 bg-linear-to-br from-accent to-accent-2 rounded-[10px] flex items-center justify-center shadow-[0_0_15px_var(--color-accent-glow)]"
           >
             <Zap className="w-5 h-5 text-white" />
           </motion.div>
@@ -314,7 +322,7 @@ function ReceiveContent() {
               <div className="text-center mb-10">
                 <motion.div
                   whileHover={{ scale: 1.05 }}
-                  className="w-16 h-16 bg-gradient-to-br from-accent to-accent-2 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-[0_0_30px_var(--color-accent-glow)] text-white"
+                  className="w-16 h-16 bg-linear-to-br from-accent to-accent-2 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-[0_0_30px_var(--color-accent-glow)] text-white"
                 >
                   <DownloadCloud className="w-8 h-8" />
                 </motion.div>
@@ -367,9 +375,9 @@ function ReceiveContent() {
                   </Button>
 
                   <div className="relative flex items-center py-4">
-                    <div className="flex-grow h-px bg-gradient-to-r from-transparent via-border-2 to-transparent" />
-                    <span className="flex-shrink-0 mx-4 text-text-3 text-[10px] uppercase tracking-[0.2em] font-semibold">Or</span>
-                    <div className="flex-grow h-px bg-gradient-to-r from-transparent via-border-2 to-transparent" />
+                    <div className="grow h-px bg-linear-to-r from-transparent via-border-2 to-transparent" />
+                    <span className="shrink-0 mx-4 text-text-3 text-[10px] uppercase tracking-[0.2em] font-semibold">Or</span>
+                    <div className="grow h-px bg-linear-to-r from-transparent via-border-2 to-transparent" />
                   </div>
 
                   <Button
@@ -664,7 +672,7 @@ function ReceivedFileRow({
       </div>
 
       <div className="flex items-center gap-3 shrink-0">
-        <span className="tag tag-green hidden sm:inline-flex flex items-center gap-1"><Check className="w-3 h-3" /> Received</span>
+        <span className="tag tag-green inline-flex items-center gap-1"><Check className="w-3 h-3" /> Received</span>
         <Button variant="ghost" onClick={onDownload} size="sm" className="text-xs h-8 px-3">
           <FileDown className="w-3.5 h-3.5 mr-1" /> Save
         </Button>

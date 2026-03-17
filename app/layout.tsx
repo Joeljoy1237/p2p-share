@@ -27,6 +27,7 @@ const jetBrainsMono = JetBrainsMono({
 });
 
 import { SignalingProvider } from '@/lib/signaling-context';
+import { Toaster } from 'react-hot-toast';
 
 export default function RootLayout({
   children,
@@ -39,6 +40,30 @@ export default function RootLayout({
         <ThemeProvider>
           <SignalingProvider>
             {children}
+            <Toaster 
+              position="bottom-right"
+              toastOptions={{
+                className: 'glass',
+                style: {
+                  background: 'rgba(15, 17, 23, 0.8)',
+                  color: '#e8eaf6',
+                  border: '1px solid rgba(255, 255, 255, 0.08)',
+                  backdropFilter: 'blur(10px)',
+                },
+                success: {
+                  iconTheme: {
+                    primary: '#22d3a0',
+                    secondary: '#0f1117',
+                  },
+                },
+                error: {
+                  iconTheme: {
+                    primary: '#f43f5e',
+                    secondary: '#0f1117',
+                  },
+                },
+              }}
+            />
           </SignalingProvider>
         </ThemeProvider>
       </body>

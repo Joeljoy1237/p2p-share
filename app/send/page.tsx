@@ -24,6 +24,7 @@ import {
   LogOut
 } from 'lucide-react';
 import { useSignaling } from '@/lib/use-signaling';
+import toast from 'react-hot-toast';
 import { formatBytes, formatSpeed, formatETA, getFileExtension, generateShareUrl, generateQRCode } from '@/lib/utils';
 import ServerStatus from '@/components/ServerStatus';
 import { Button } from '@/components/ui/Button';
@@ -79,12 +80,14 @@ export default function SendPage() {
     setIsDragging(false);
     const dropped = Array.from(e.dataTransfer.files);
     if (dropped.length > 0) {
-      setFiles((prev) => {
-        const existing = new Set(prev.map((f) => f.name + f.size));
-        return [...prev, ...dropped.filter((f) => !existing.has(f.name + f.size))];
-      });
+      const existing = new Set(files.map((f) => f.name + f.size));
+      const newFiles = dropped.filter((f) => !existing.has(f.name + f.size));
+      if (newFiles.length > 0) {
+        setFiles((prev) => [...prev, ...newFiles]);
+        toast.success(`Added ${newFiles.length} file${newFiles.length !== 1 ? 's' : ''}`);
+      }
     }
-  }, []);
+  }, [files]);
 
   const handleFolderSelect = async () => {
     try {
@@ -105,21 +108,26 @@ export default function SendPage() {
 
       await processHandle(dirHandle);
 
-      setFiles((prev) => {
-        const existing = new Set(prev.map((f) => f.name + f.size));
-        return [...prev, ...selectedFiles.filter((f) => !existing.has(f.name + f.size))];
-      });
+      const existing = new Set(files.map((f) => f.name + f.size));
+      const newFiles = selectedFiles.filter((f) => !existing.has(f.name + f.size));
+      if (newFiles.length > 0) {
+        setFiles((prev) => [...prev, ...newFiles]);
+        toast.success(`Imported ${newFiles.length} file${newFiles.length !== 1 ? 's' : ''} from folder`);
+      }
     } catch (err) {
       console.error('Folder picker error:', err);
+      toast.error('Failed to import folder');
     }
   };
 
   const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = Array.from(e.target.files || []);
-    setFiles((prev) => {
-      const existing = new Set(prev.map((f) => f.name + f.size));
-      return [...prev, ...selected.filter((f) => !existing.has(f.name + f.size))];
-    });
+    const existing = new Set(files.map((f) => f.name + f.size));
+    const newFiles = selected.filter((f) => !existing.has(f.name + f.size));
+    if (newFiles.length > 0) {
+      setFiles((prev) => [...prev, ...newFiles]);
+      toast.success(`Added ${newFiles.length} file${newFiles.length !== 1 ? 's' : ''}`);
+    }
   };
 
   const removeFile = (index: number) => {
@@ -129,12 +137,16 @@ export default function SendPage() {
   const handleSend = () => {
     if (files.length > 0 && connectedPeers.length > 0) {
       sendFiles(files);
+      toast.loading('Starting transfer...', { duration: 3000, icon: '🚀' });
+    } else if (connectedPeers.length === 0) {
+      toast.error('Waiting for a receiver to join...', { icon: '⏳' });
     }
   };
 
-  const copyToClipboard = (text: string) => {
+  const copyToClipboard = (text: string, label: string) => {
     navigator.clipboard.writeText(text);
     setCopied(true);
+    toast.success(`${label} copied to clipboard`);
     setTimeout(() => setCopied(false), 2000);
   };
 
@@ -162,14 +174,14 @@ export default function SendPage() {
       </div>
 
       {/* Header */}
-      <header className="relative z-10 glass sticky top-0 flex items-center justify-between px-6 md:px-10 py-3.5 border-b border-border border-t-0 border-x-0">
+      <header className="z-10 glass sticky top-0 flex items-center justify-between px-6 md:px-10 py-3.5 border-b border-border border-t-0 border-x-0">
         <div
           onClick={() => router.push('/')}
           className="cursor-pointer flex items-center gap-3"
         >
           <motion.div
             whileHover={{ scale: 1.05, rotate: 2 }}
-            className="w-9 h-9 bg-gradient-to-br from-accent to-accent-2 rounded-[10px] flex items-center justify-center shadow-[0_0_15px_var(--color-accent-glow)]"
+            className="w-9 h-9 bg-linear-to-br from-accent to-accent-2 rounded-[10px] flex items-center justify-center shadow-[0_0_15px_var(--color-accent-glow)]"
           >
             <Zap className="w-5 h-5 text-white" />
           </motion.div>
@@ -202,7 +214,7 @@ export default function SendPage() {
               <Card glass className="p-8 sm:p-12 text-center max-w-xl mx-auto mt-10">
                 <motion.div
                   whileHover={{ scale: 1.05 }}
-                  className="w-16 h-16 bg-gradient-to-br from-accent to-accent-2 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-[0_0_30px_var(--color-accent-glow)] text-white"
+                  className="w-16 h-16 bg-linear-to-br from-accent to-accent-2 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-[0_0_30px_var(--color-accent-glow)] text-white"
                 >
                   <Zap className="w-8 h-8" />
                 </motion.div>
@@ -409,7 +421,7 @@ export default function SendPage() {
                   </div>
                   <div
                     className="room-code-display text-4xl py-5 px-4"
-                    onClick={() => copyToClipboard(room.code)}
+                    onClick={() => copyToClipboard(room.code, 'Room code')}
                     title="Click to copy"
                   >
                     {room.code}
@@ -418,7 +430,7 @@ export default function SendPage() {
 
                 <Button
                   variant="ghost"
-                  onClick={() => copyToClipboard(shareUrl)}
+                  onClick={() => copyToClipboard(shareUrl, 'Share link')}
                   className="w-full text-sm font-medium"
                 >
                   {copied ? (

@@ -3,6 +3,7 @@
 
 import React, { createContext, useContext, useEffect, useRef, useCallback, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
+import toast from 'react-hot-toast';
 import { P2PConnection, DEFAULT_RTC_CONFIG } from './peer-connection';
 import type { FileMetadata, TransferProgress, Room } from '@/types';
 import type { ConnectionStatus, ReceivedFile, UseSignalingReturn } from './use-signaling';
@@ -115,6 +116,7 @@ export function SignalingProvider({ children }: { children: React.ReactNode }) {
         setPendingPeers(prev => prev.filter(id => id !== peerId));
         setConnectedPeers(prev => [...new Set([...prev, peerId])]);
         setStatus('connected');
+        toast.success(`Connected to peer ${peerId.slice(0, 4)}`, { id: `conn-${peerId}` });
       });
 
       conn.on('disconnected', (data) => {
@@ -149,6 +151,10 @@ export function SignalingProvider({ children }: { children: React.ReactNode }) {
 
       conn.on('file-received', (data) => {
         const item = data as ReceivedFile;
+        toast.success(`Received: ${item.metadata.name}`, { icon: '✅', id: `received-${item.fileId}` });
+        // Dismiss saving toast if it exists
+        toast.dismiss(`save-${item.fileId}`);
+        
         setReceivedFiles((prev) => {
           if (prev.some(f => f.fileId === item.fileId)) return prev;
           return [...prev, { ...item, receivedAt: Date.now() }];
@@ -169,6 +175,7 @@ export function SignalingProvider({ children }: { children: React.ReactNode }) {
         clearTimeout(watchdog);
         setPendingPeers(prev => prev.filter(id => id !== peerId));
         setError(`P2P Error: ${errMsg}`);
+        toast.error(`P2P Error: ${errMsg}`);
         conn.close();
         connectionsRef.current.delete(peerId);
         setConnectedPeers(prev => prev.filter(id => id !== peerId));
@@ -197,7 +204,9 @@ export function SignalingProvider({ children }: { children: React.ReactNode }) {
     s.off('peer-joined');
     s.off('peer-left');
     s.off('signal');
+    s.off('signal-error');
     s.off('room-expired');
+    s.off('server-shutdown');
 
     s.on('connect', () => {
       const newId = s.id || '';
@@ -223,6 +232,7 @@ export function SignalingProvider({ children }: { children: React.ReactNode }) {
 
     s.on('peer-joined', ({ peerId }: { peerId: string }) => {
       getOrCreateConnection(peerId, s.id! < peerId);
+      toast.success(`Peer joined the room`, { icon: '🤝' });
     });
 
     s.on('peer-left', ({ peerId }: { peerId: string }) => {
@@ -233,6 +243,7 @@ export function SignalingProvider({ children }: { children: React.ReactNode }) {
       }
       setPendingPeers(prev => prev.filter(id => id !== peerId));
       setConnectedPeers(prev => prev.filter(id => id !== peerId));
+      toast.error(`Peer left the room`, { icon: '👋', duration: 3000 });
     });
 
     s.on('signal', async ({ peerId, signal }: any) => {
@@ -252,10 +263,31 @@ export function SignalingProvider({ children }: { children: React.ReactNode }) {
       }
     });
 
+    s.on('signal-error', (data: any) => {
+      console.error(`[SIGNALING] Signal error:`, data.message);
+      setError(`Signaling Error: ${data.message}`);
+      toast.error(data.message);
+    });
+
     s.on('room-expired', () => {
       setError('Room has expired');
       setRoom(null);
       setStatus('disconnected');
+      toast.error('Room has expired', { icon: '⏰' });
+    });
+
+    s.on('server-shutdown', (data: any) => {
+      console.warn(`[SIGNALING] Server shutdown:`, data.message);
+      const msg = 'Server is shutting down or restarting. Please refresh to reconnect.';
+      setError(msg);
+      toast.error(msg, { duration: 10000, icon: '⚠️' });
+      s.disconnect();
+      setRoom(null);
+      setConnectedPeers([]);
+      setPendingPeers([]);
+      connectionsRef.current.forEach(c => c.close());
+      connectionsRef.current.clear();
+      setStatus('error');
     });
 
     return () => {
@@ -263,7 +295,9 @@ export function SignalingProvider({ children }: { children: React.ReactNode }) {
       s.off('peer-joined');
       s.off('peer-left');
       s.off('signal');
+      s.off('signal-error');
       s.off('room-expired');
+      s.off('server-shutdown');
     };
   }, [getOrCreateConnection]);
 
@@ -277,6 +311,7 @@ export function SignalingProvider({ children }: { children: React.ReactNode }) {
         if (res.success) {
           setRoom(res.room);
           setStatus('connected');
+          toast.success('Room created successfully');
           resolve(res.room);
         } else {
           setError(res.error);
@@ -297,6 +332,7 @@ export function SignalingProvider({ children }: { children: React.ReactNode }) {
         if (res.success) {
           setRoom(res.room);
           setStatus('connected');
+          toast.success('Joined room successfully');
           res.existingPeers.forEach((p: string) => getOrCreateConnection(p, s.id! < p));
           resolve();
         } else {

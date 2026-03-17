@@ -62,15 +62,15 @@ P2PShare uses a **Signaling Server** to help peers find each other and exchange 
    npm install
    ```
 
-3. Configure environment variables in `.env.local`:
-   ```env
-   NEXT_PUBLIC_SIGNAL_URL=http://localhost:3001
-   SIGNAL_PORT=3001
+3. Copy the environment template:
+   ```bash
+   cp .env.example .env.local
    ```
+   *Ensure you have a Redis instance running (default is `redis://localhost:6379`).*
 
 ### Running the Application
 
-1. **Start the Signaling Server**:
+1. Start the Redis-backed signaling server:
    ```bash
    npm run server
    ```

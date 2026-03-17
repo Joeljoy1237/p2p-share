@@ -1,51 +1,42 @@
 import { createServer } from 'http';
 import { Server, Socket } from 'socket.io';
 import { v4 as uuidv4 } from 'uuid';
+import { RedisService, RoomOptions, Room } from './redis-service';
+
+// Required for environment variables in the standalone server script
+import dotenv from 'dotenv';
+dotenv.config({ path: '.env.local' });
 
 const PORT = process.env.SIGNAL_PORT || 3001;
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 
 const httpServer = createServer();
 const io = new Server(httpServer, {
   cors: {
-    origin: '*',
+    origin: CORS_ORIGIN.split(',').map(o => o.trim()),
     methods: ['GET', 'POST'],
   },
   pingTimeout: 60000,
   pingInterval: 25000,
-  maxHttpBufferSize: 1e8, // 100MB for signaling messages
+  maxHttpBufferSize: 1e6, // 1MB for signaling messages
 });
 
-// Interfaces
-interface RoomOptions {
-  maxPeers?: number;
-  password?: string | null;
-}
+const redisService = new RedisService(REDIS_URL);
 
-interface Room {
-  id: string;
-  code: string;
-  createdAt: number;
-  expiresAt: number;
-  peers: Map<string, Socket>;
-  maxPeers: number;
-  password?: string | null;
-  isPasswordProtected: boolean;
-}
-
-// In-memory room store (use Redis for production)
-const rooms = new Map<string, Room>();
-const peerToRoom = new Map<string, string>();
-const emptyRoomTimeouts = new Map<string, NodeJS.Timeout>();
-
-function createRoom(options: RoomOptions = {}): Room {
+async function createRoom(options: RoomOptions = {}): Promise<Room> {
   const roomId = uuidv4();
-  let code = generateCode();
+  let code = await generateCode();
   
   // Ensure code uniqueness (basic collision prevention)
   let attempts = 0;
-  while (rooms.has(code) && attempts < 10) {
-    code = generateCode();
+  while ((await redisService.getRoom(code)) && attempts < 100) {
+    code = await generateCode();
     attempts++;
+  }
+
+  if (attempts >= 100) {
+      throw new Error("Failed to generate a unique room code after 100 attempts.");
   }
   
   const room: Room = {
@@ -53,113 +44,74 @@ function createRoom(options: RoomOptions = {}): Room {
     code,
     createdAt: Date.now(),
     expiresAt: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
-    peers: new Map(),
     maxPeers: options.maxPeers || 10,
     password: options.password || null,
     isPasswordProtected: !!options.password,
   };
-  rooms.set(roomId, room);
-  rooms.set(code, room); // also index by code
+  
+  await redisService.saveRoom(room);
   return room;
 }
 
-function generateCode(): string {
+async function generateCode(): Promise<string> {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
-  for (let i = 0; i < 6; i++) {
+  // Increased code length to 8 characters to reduce collision probability
+  for (let i = 0; i < 8; i++) {
     code += chars[Math.floor(Math.random() * chars.length)];
   }
   return code;
 }
 
-function getRoomInfo(room: Room) {
+async function getRoomInfo(room: Room | null) {
+  if (!room) return null;
+  const peerCount = await redisService.getRoomPeerCount(room.id);
   return {
     id: room.id,
     code: room.code,
     createdAt: room.createdAt,
     expiresAt: room.expiresAt,
-    peerCount: room.peers.size,
+    peerCount: peerCount,
     maxPeers: room.maxPeers,
     isPasswordProtected: room.isPasswordProtected,
   };
 }
 
-// Cleanup expired rooms every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  const processedRoomIds = new Set<string>();
-  
-  for (const [key, room] of rooms.entries()) {
-    if (processedRoomIds.has(room.id)) continue;
-    processedRoomIds.add(room.id);
-
-    if (room.expiresAt < now) {
-      console.log(`[CLEANUP] Room ${room.code} expired`);
-      for (const [peerId, peerSocket] of room.peers.entries()) {
-        peerSocket.emit('room-expired');
-        peerSocket.leave(room.id);
-      }
-      rooms.delete(room.id);
-      // Only delete by code if it still points to this room
-      if (rooms.get(room.code) === room) {
-        rooms.delete(room.code);
-      }
-    }
-  }
-}, 5 * 60 * 1000);
-
-// Rate limiting state
-const rateLimits = new Map<string, { count: number; lastReset: number }>();
-
-function isRateLimited(socketId: string, limit: number = 30, windowMs: number = 60000): boolean {
-  const now = Date.now();
-  const state = rateLimits.get(socketId) || { count: 0, lastReset: now };
-
-  if (now - state.lastReset > windowMs) {
-    state.count = 0;
-    state.lastReset = now;
-  }
-
-  state.count++;
-  rateLimits.set(socketId, state);
-
-  return state.count > limit;
-}
-
-// Cleanup rate limits every hour
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, state] of rateLimits.entries()) {
-    if (now - state.lastReset > 3600000) {
-      rateLimits.delete(id);
-    }
-  }
-}, 3600000);
-
 io.on('connection', (socket: Socket) => {
   console.log(`[+] Client connected: ${socket.id}`);
 
   // Create a new room
-  socket.on('create-room', (options: RoomOptions, callback: (response: any) => void) => {
-    if (isRateLimited(socket.id, 10, 60000)) { // Max 10 rooms per minute
+  socket.on('create-room', async (options: RoomOptions, callback: (response: any) => void) => {
+    // Rate limit per IP
+    const clientIp = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+    const rateLimitKey = `create_room:${clientIp}`;
+
+    if (await redisService.isRateLimited(rateLimitKey as string, 10, 60000)) { // Max 10 rooms per minute
       return callback({ success: false, error: 'Rate limit exceeded. Please wait a minute.' });
     }
 
-    // Validate options
-    const maxPeers = Math.min(Math.max(2, options.maxPeers || 10), 50); // Hard limit 50 peers
-    const room = createRoom({ ...options, maxPeers });
-    
-    socket.join(room.id);
-    room.peers.set(socket.id, socket);
-    peerToRoom.set(socket.id, room.id);
+    try {
+      // Validate options
+      const maxPeers = Math.min(Math.max(2, options.maxPeers || 10), 50); // Hard limit 50 peers
+      const room = await createRoom({ ...options, maxPeers });
+      
+      socket.join(room.id);
+      await redisService.addPeerToRoom(room.id, socket.id);
 
-    console.log(`[ROOM] Created: ${room.code} (${room.id})`);
-    callback({ success: true, room: getRoomInfo(room) });
+      console.log(`[ROOM] Created: ${room.code} (${room.id})`);
+      callback({ success: true, room: await getRoomInfo(room) });
+    } catch (error) {
+      console.error(`[ROOM] Error creating room`, error);
+      callback({ success: false, error: 'Internal server error while creating room.' });
+    }
   });
 
   // Join an existing room by ID or code
-  socket.on('join-room', (data: { roomIdOrCode: string; password?: string }, callback: (response: any) => void) => {
-    if (isRateLimited(socket.id, 60, 60000)) { // Max 60 join attempts per minute
+  socket.on('join-room', async (data: { roomIdOrCode: string; password?: string }, callback: (response: any) => void) => {
+    const clientIp = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+    const rateLimitKey = `join_room:${clientIp}`;
+
+    if (await redisService.isRateLimited(rateLimitKey as string, 60, 60000)) { // Max 60 join attempts per minute
       return callback({ success: false, error: 'Rate limit exceeded.' });
     }
 
@@ -169,227 +121,229 @@ io.on('connection', (socket: Socket) => {
     }
 
     const input = String(roomIdOrCode).trim();
-    // Try code (uppercase) first, then original (for UUIDs)
-    let room = rooms.get(input.toUpperCase()) || rooms.get(input);
+    
+    try {
+      const room = await redisService.getRoom(input);
 
-    if (!room) {
-      return callback({ success: false, error: 'Room not found' });
-    }
-
-    if (room.expiresAt < Date.now()) {
-      rooms.delete(room.id);
-      if (rooms.get(room.code) === room) {
-        rooms.delete(room.code);
+      if (!room) {
+        return callback({ success: false, error: 'Room not found' });
       }
-      return callback({ success: false, error: 'Room has expired' });
-    }
 
-    if (room.peers.size >= room.maxPeers) {
-      return callback({ success: false, error: 'Room is full' });
-    }
+      if (room.expiresAt < Date.now()) {
+        return callback({ success: false, error: 'Room has expired' });
+      }
 
-    if (room.isPasswordProtected && room.password !== password) {
-      return callback({ success: false, error: 'Invalid password' });
-    }
+      const peerCount = await redisService.getRoomPeerCount(room.id);
+      if (peerCount >= room.maxPeers) {
+        return callback({ success: false, error: 'Room is full' });
+      }
 
-    // Check if we are already in this room to avoid double-join logic
-    if (room.peers.has(socket.id)) {
-      console.log(`[ROOM] ${socket.id} already in room ${room.code}, ignoring redundant join.`);
-      return callback({
-        success: true,
-        room: getRoomInfo(room),
-        existingPeers: [...room.peers.keys()].filter((id) => id !== socket.id),
+      if (room.isPasswordProtected && room.password !== password) {
+        return callback({ success: false, error: 'Invalid password' });
+      }
+
+      // Check if we are already in this room to avoid double-join logic
+      const existingPeers = await redisService.getRoomPeers(room.id);
+      if (existingPeers.includes(socket.id)) {
+        console.log(`[ROOM] ${socket.id} already in room ${room.code}, ignoring redundant join.`);
+        return callback({
+          success: true,
+          room: await getRoomInfo(room),
+          existingPeers: existingPeers.filter((id) => id !== socket.id),
+        });
+      }
+
+      socket.join(room.id);
+      await redisService.addPeerToRoom(room.id, socket.id);
+
+      // Notify existing peers
+      socket.to(room.id).emit('peer-joined', {
+        peerId: socket.id,
+        peerCount: peerCount + 1,
       });
+
+      console.log(`[ROOM] ${socket.id} joined room ${room.code}`);
+      callback({
+        success: true,
+        room: await getRoomInfo(room),
+        existingPeers,
+      });
+    } catch (error) {
+      console.error(`[ROOM] Error joining room ${input}:`, error);
+      callback({ success: false, error: 'Internal server error while joining room.' });
     }
-
-    // Cancel any pending cleanup timeout
-    if (emptyRoomTimeouts.has(room.id)) {
-      clearTimeout(emptyRoomTimeouts.get(room.id)!);
-      emptyRoomTimeouts.delete(room.id);
-      console.log(`[ROOM] Cancelled cleanup for ${room.code} (peer re-joined)`);
-    }
-
-    socket.join(room.id);
-    room.peers.set(socket.id, socket);
-    peerToRoom.set(socket.id, room.id);
-
-    // Notify existing peers
-    socket.to(room.id).emit('peer-joined', {
-      peerId: socket.id,
-      peerCount: room.peers.size,
-    });
-
-    // Send list of existing peers to the new joiner
-    const existingPeers = [...room.peers.keys()].filter((id) => id !== socket.id);
-
-    console.log(`[ROOM] ${socket.id} joined room ${room.code}`);
-    callback({
-      success: true,
-      room: getRoomInfo(room),
-      existingPeers,
-    });
   });
 
   // WebRTC Signaling
-  socket.on('signal', (data: { targetPeerId: string; signal: any }) => {
+  socket.on('signal', async (data: { targetPeerId: string; signal: any }) => {
     const { targetPeerId, signal } = data;
     if (!targetPeerId || !signal) return;
 
-    const roomId = peerToRoom.get(socket.id);
-    if (!roomId) {
-      console.warn(`[SIGNAL] No room for ${socket.id}`);
-      return;
-    }
+    try {
+      const roomId = await redisService.getPeerRoom(socket.id);
+      if (!roomId) {
+        console.warn(`[SIGNAL] No room for ${socket.id}`);
+        socket.emit('signal-error', { message: 'You are not in a room.' });
+        return;
+      }
 
-    const room = rooms.get(roomId);
-    if (!room) {
-      console.warn(`[SIGNAL] Room ${roomId} not found for ${socket.id}`);
-      return;
-    }
+      const roomPeers = await redisService.getRoomPeers(roomId);
+      if (!roomPeers.includes(targetPeerId)) {
+        console.warn(`[SIGNAL] Target ${targetPeerId} not found in room ${roomId}`);
+        socket.emit('signal-error', { 
+            targetPeerId, 
+            message: 'Target peer not found or disconnected.' 
+        });
+        return;
+      }
 
-    const targetSocket = room.peers.get(targetPeerId);
-    if (targetSocket) {
-      // Basic signal validation - prevent huge signal objects
       if (JSON.stringify(signal).length > 100000) {
         console.warn(`[SIGNAL] Rejected oversized signal from ${socket.id}`);
         return;
       }
 
       console.log(`[SIGNAL] ${socket.id} -> ${targetPeerId} (${signal.type})`);
-      targetSocket.emit('signal', {
+      socket.to(targetPeerId).emit('signal', {
         peerId: socket.id,
         signal,
       });
-    } else {
-      console.warn(`[SIGNAL] Target ${targetPeerId} not found in room ${room.code}`);
+    } catch (error) {
+      console.error(`[SIGNAL] Error routing signal:`, error);
     }
   });
 
   // Broadcast to all peers in room
-  socket.on('broadcast-signal', (data: { signal: any }) => {
+  socket.on('broadcast-signal', async (data: { signal: any }) => {
     const { signal } = data;
     if (!signal) return;
 
-    const roomId = peerToRoom.get(socket.id);
-    if (!roomId) return;
+    try {
+      const roomId = await redisService.getPeerRoom(socket.id);
+      if (!roomId) return;
+      if (JSON.stringify(signal).length > 100000) return;
 
-    if (JSON.stringify(signal).length > 100000) return;
-
-    socket.to(roomId).emit('signal', {
-      peerId: socket.id,
-      signal,
-    });
+      socket.to(roomId).emit('signal', {
+        peerId: socket.id,
+        signal,
+      });
+    } catch (error) {
+      console.error(`[SIGNAL] Error broadcasting signal:`, error);
+    }
   });
 
   // Get room info
-  socket.on('get-room', (data: { roomIdOrCode: string }, callback: (response: any) => void) => {
+  socket.on('get-room', async (data: { roomIdOrCode: string }, callback: (response: any) => void) => {
     const { roomIdOrCode } = data;
     if (!roomIdOrCode) return callback({ success: false });
 
     const sanitizedIdOrCode = String(roomIdOrCode).toUpperCase().trim().slice(0, 50);
-    const room = rooms.get(sanitizedIdOrCode);
-    if (!room) {
-      return callback({ success: false, error: 'Room not found' });
+    try {
+      const room = await redisService.getRoom(sanitizedIdOrCode);
+      if (!room) {
+        return callback({ success: false, error: 'Room not found' });
+      }
+      callback({ success: true, room: await getRoomInfo(room) });
+    } catch (error) {
+      console.error(`[ROOM] Error getting room info:`, error);
+      callback({ success: false, error: 'Internal server error.' });
     }
-    callback({ success: true, room: getRoomInfo(room) });
   });
 
   // Chat message
-  socket.on('chat-message', (data: { message: string }) => {
+  socket.on('chat-message', async (data: { message: string }) => {
     const { message } = data;
     if (!message || typeof message !== 'string' || message.length > 5000) return;
 
-    const roomId = peerToRoom.get(socket.id);
-    if (!roomId) return;
+    try {
+      const roomId = await redisService.getPeerRoom(socket.id);
+      if (!roomId) return;
 
-    socket.to(roomId).emit('chat-message', {
-      peerId: socket.id,
-      message,
-      timestamp: Date.now(),
-    });
+      socket.to(roomId).emit('chat-message', {
+        peerId: socket.id,
+        message,
+        timestamp: Date.now(),
+      });
+    } catch (error) {
+       console.error(`[CHAT] Error sending message:`, error);
+    }
   });
 
   // Transfer metadata broadcast
-  socket.on('transfer-start', (data: { files: any[] }) => {
+  socket.on('transfer-start', async (data: { files: any[] }) => {
     const { files } = data;
     if (!Array.isArray(files) || files.length > 100) return;
 
-    const roomId = peerToRoom.get(socket.id);
-    if (!roomId) return;
+    try {
+      const roomId = await redisService.getPeerRoom(socket.id);
+      if (!roomId) return;
 
-    socket.to(roomId).emit('transfer-start', {
-      peerId: socket.id,
-      files,
-    });
+      socket.to(roomId).emit('transfer-start', {
+        peerId: socket.id,
+        files,
+      });
+    } catch (error) {
+      console.error(`[TRANSFER] Error broadcasting transfer start:`, error);
+    }
   });
 
   // Health check
-  socket.on('ping', (callback: (response: any) => void) => {
-    callback({
-      success: true,
-      status: 'alive',
-      time: Date.now(),
-      rooms: rooms.size / 2, // Divided by 2 because we index by both ID and code
-      uptime: process.uptime(),
-    });
+  socket.on('ping', async (callback: (response: any) => void) => {
+    try {
+      // verify redis is alive
+      await redisService.getRoom('healthcheck');
+      callback({
+        success: true,
+        status: 'alive',
+        time: Date.now(),
+        uptime: process.uptime(),
+        backend: 'redis'
+      });
+    } catch (error) {
+      callback({ success: false, status: 'degraded', error: 'Redis connection failing' });
+    }
   });
 
-  // Leave room
-  socket.on('leave-room', () => {
-    const roomId = peerToRoom.get(socket.id);
-    if (roomId) {
-      const room = rooms.get(roomId);
-      if (room) {
-        room.peers.delete(socket.id);
+  const handleDisconnectOrLeave = async () => {
+    try {
+      const roomId = await redisService.getPeerRoom(socket.id);
+      if (roomId) {
+        await redisService.removePeerFromRoom(roomId, socket.id);
         socket.leave(roomId);
+        
+        const peerCount = await redisService.getRoomPeerCount(roomId);
+        
         socket.to(roomId).emit('peer-left', {
           peerId: socket.id,
-          peerCount: room.peers.size,
+          peerCount: peerCount,
         });
 
-        if (room.peers.size === 0) {
-          const timeout = setTimeout(() => {
-            const currentRoom = rooms.get(room.id);
-            if (currentRoom && currentRoom.peers.size === 0) {
-              rooms.delete(room.id);
-              rooms.delete(room.code);
-              emptyRoomTimeouts.delete(room.id);
-            }
-          }, 30000);
-          emptyRoomTimeouts.set(room.id, timeout);
+        if (peerCount === 0) {
+           console.log(`[ROOM] Room ${roomId} is empty. Scheduling rapid cleanup.`);
+           const room = await redisService.getRoom(roomId);
+           if (room) {
+               setTimeout(async () => {
+                   const currentCount = await redisService.getRoomPeerCount(roomId);
+                   if (currentCount === 0) {
+                       await redisService.deleteRoom(roomId, room.code);
+                       console.log(`[ROOM] Deleted empty room ${room.code} (${roomId})`);
+                   }
+               }, 30000);
+           }
         }
       }
-      peerToRoom.delete(socket.id);
+    } catch (error) {
+      console.error(`[ROOM] Error handling peer leave for socket ${socket.id}:`, error);
     }
+  };
+
+  // Leave room
+  socket.on('leave-room', async () => {
+    await handleDisconnectOrLeave();
   });
 
   // Handle disconnect
-  socket.on('disconnect', () => {
-    const roomId = peerToRoom.get(socket.id);
-    if (roomId) {
-      const room = rooms.get(roomId);
-      if (room) {
-        room.peers.delete(socket.id);
-        socket.to(roomId).emit('peer-left', {
-          peerId: socket.id,
-          peerCount: room.peers.size,
-        });
-
-        if (room.peers.size === 0) {
-          const timeout = setTimeout(() => {
-            const currentRoom = rooms.get(room.id);
-            if (currentRoom && currentRoom.peers.size === 0) {
-              rooms.delete(room.id);
-              rooms.delete(room.code);
-              emptyRoomTimeouts.delete(room.id);
-            }
-          }, 30000);
-          emptyRoomTimeouts.set(room.id, timeout);
-        }
-      }
-      peerToRoom.delete(socket.id);
-    }
-
+  socket.on('disconnect', async () => {
+    await handleDisconnectOrLeave();
     console.log(`[-] Client disconnected: ${socket.id}`);
   });
 });
@@ -403,10 +357,37 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('[SERVER] Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
+// Graceful Shutdown
+function gracefulShutdown() {
+  console.log('[SERVER] Received shutdown signal. Notifying clients and exiting...');
+  // Notify all connected sockets
+  io.emit('server-shutdown', { message: 'Server is shutting down for maintenance or scaling.' });
+  
+  // Disconnect resources
+  redisService.disconnect().then(() => {
+    httpServer.close(() => {
+      console.log('[SERVER] Closed out remaining connections.');
+      process.exit(0);
+    });
+  }).catch((err) => {
+    console.error('[SERVER] Error during Redis disconnect:', err);
+    process.exit(1);
+  });
+  
+  // Force close after 10 seconds if not gracefully closed
+  setTimeout(() => {
+    console.error('[SERVER] Could not close connections in time, forcefully shutting down');
+    process.exit(1);
+  }, 10000);
+}
+
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
+
 httpServer.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════╗
-║   P2P Share - Signaling Server               ║
+║   P2P Share - Signaling Server (Redis)       ║
 ║   Listening on port ${PORT}                     ║
 ╚══════════════════════════════════════════════╝
   `);
