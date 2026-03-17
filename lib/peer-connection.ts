@@ -11,7 +11,7 @@ import type {
 const CHUNK_SIZE = 128 * 1024; // 128KB chunks (stable throughput, balanced overhead)
 const MAX_BUFFERED_AMOUNT = 1 * 1024 * 1024; // 1MB per-channel initial limit
 const BUFFER_THRESHOLD = 512 * 1024; // 512KB threshold
-const GLOBAL_MAX_BUFFER = 16 * 1024 * 1024; // 16MB total limit across all channels
+const GLOBAL_MAX_BUFFER = 32 * 1024 * 1024; // 32MB total limit across all channels
 
 function formatBytes(bytes: number) {
   if (bytes === 0) return '0 Bytes';
@@ -123,7 +123,7 @@ export class P2PConnection {
   // Performance Tuning (Adaptive)
   private adaptiveMaxBuffer = MAX_BUFFERED_AMOUNT;
   private adaptiveThreshold = BUFFER_THRESHOLD;
-  private numChannels = 4;
+  private numChannels = 8;
 
   // Send state
   private sendQueue: File[] = [];
@@ -145,6 +145,8 @@ export class P2PConnection {
   private receiveMetas: Map<string, FileMetadata> = new Map();
   private receiveProgress: Map<string, number> = new Map();
   private receiveStats: Map<string, { lastSpeedCalc: number, lastBytesReceived: number, currentSpeed: number }> = new Map();
+  private receiveChunkCounts: Map<string, number> = new Map();
+  private receiveFileEndReached: Map<string, boolean> = new Map();
   private fileIdDecoder = new TextDecoder();
   private fileIdDecoderCache: Map<string, string> = new Map(); // Cache decoded fileIds
   private receiverPaused = false; // Backpressure state
@@ -155,7 +157,7 @@ export class P2PConnection {
   // Message queue for serialized processing — prevents race conditions
   private messageQueue: (ArrayBuffer | string)[] = [];
   private processingMessage = false;
-  private writeQueue = new ParallelTaskQueue(32); // Concurrency 32 for maximum SSD saturation
+  private writeQueue = new ParallelTaskQueue(16); // Concurrency 16 for balanced SSD I/O
 
   private getTotalBufferedAmount(): number {
     return this.dataChannels.reduce((sum, c) => sum + (c?.bufferedAmount || 0), 0);
@@ -350,8 +352,8 @@ export class P2PConnection {
     channel.bufferedAmountLowThreshold = this.adaptiveThreshold;
     channel.onbufferedamountlow = () => {
       // AIMD: Increase buffer limit moderately on success
-      if (this.adaptiveMaxBuffer < 64 * 1024 * 1024) { // Cap at 64MB
-        this.adaptiveMaxBuffer += 512 * 1024; // Add 512KB (safer ramp-up)
+      if (this.adaptiveMaxBuffer < 128 * 1024 * 1024) { // Cap at 128MB
+        this.adaptiveMaxBuffer += 1024 * 1024; // Add 1MB (more aggressive ramp-up)
         this.adaptiveThreshold = this.adaptiveMaxBuffer / 2;
         channel.bufferedAmountLowThreshold = this.adaptiveThreshold;
       }
@@ -443,6 +445,17 @@ export class P2PConnection {
         this.receiverPaused = false;
         this.send(JSON.stringify({ type: 'resume', fileId: '' }));
       }
+
+      // Completion check for unordered delivery
+      const currentCount = (this.receiveChunkCounts.get(fileId!) || 0) + 1;
+      this.receiveChunkCounts.set(fileId!, currentCount);
+      
+      const meta = this.receiveMetas.get(fileId!);
+      const totalExpected = meta ? Math.ceil(meta.size / CHUNK_SIZE) : 0;
+      
+      if (this.receiveFileEndReached.get(fileId!) && currentCount >= totalExpected) {
+        this.finalizeFile(fileId!);
+      }
     });
 
     const meta = this.receiveMetas.get(fileId);
@@ -483,6 +496,50 @@ export class P2PConnection {
     }
   }
 
+  private async finalizeFile(fileId: string) {
+    const meta = this.receiveMetas.get(fileId);
+    if (!meta) return;
+
+    const stream = this.writableStreams.get(fileId);
+    if (stream) {
+      try {
+        await stream.close();
+      } catch (err) {
+        console.error('[P2P] Error closing file stream:', err);
+      }
+      this.cleanupReceiverFile(fileId);
+      // Signal completion
+      this.emit('progress', {
+        fileId,
+        fileName: meta.name,
+        totalSize: meta.size,
+        transferredBytes: meta.size,
+        percentage: 100,
+        speed: 0,
+        eta: 0,
+        status: 'completed',
+        fileType: meta.type,
+      });
+      this.emit('file-received', {
+        fileId,
+        metadata: meta,
+        streamed: true,
+        receivedAt: Date.now(),
+      });
+    } else {
+      this.assembleFile(fileId);
+    }
+  }
+
+  private cleanupReceiverFile(fileId: string) {
+    this.writableStreams.delete(fileId);
+    this.receiveStats.delete(fileId);
+    this.receiveBuffers.delete(fileId);
+    this.receiveProgress.delete(fileId);
+    this.receiveChunkCounts.delete(fileId);
+    this.receiveFileEndReached.delete(fileId);
+  }
+
   private async handleControlMessage(msg: ChunkMessage) {
     switch (msg.type) {
       case 'file-meta':
@@ -509,41 +566,13 @@ export class P2PConnection {
         break;
 
       case 'file-end': {
-        const endMeta = this.receiveMetas.get(msg.fileId);
-        const stream = this.writableStreams.get(msg.fileId);
-        if (stream) {
-          try {
-            await stream.close();
-          } catch (err) {
-            console.error('[P2P] Error closing file stream:', err);
-          }
-          this.writableStreams.delete(msg.fileId);
-          this.receiveStats.delete(msg.fileId);
-          this.receiveBuffers.delete(msg.fileId);
-          this.receiveProgress.delete(msg.fileId);
-          // Signal completion without assembling in memory
-          if (endMeta) {
-            // Emit completed progress so receiver UI updates
-            this.emit('progress', {
-              fileId: msg.fileId,
-              fileName: endMeta.name,
-              totalSize: endMeta.size,
-              transferredBytes: endMeta.size,
-              percentage: 100,
-              speed: 0,
-              eta: 0,
-              status: 'completed',
-              fileType: endMeta.type,
-            });
-            this.emit('file-received', {
-              fileId: msg.fileId,
-              metadata: endMeta,
-              streamed: true,
-              receivedAt: Date.now(),
-            });
-          }
-        } else {
-          this.assembleFile(msg.fileId);
+        this.receiveFileEndReached.set(msg.fileId, true);
+        const meta = this.receiveMetas.get(msg.fileId);
+        const receivedCount = this.receiveChunkCounts.get(msg.fileId) || 0;
+        const totalExpected = meta ? Math.ceil(meta.size / CHUNK_SIZE) : 0;
+        
+        if (receivedCount >= totalExpected) {
+          await this.finalizeFile(msg.fileId);
         }
         break;
       }
@@ -571,6 +600,8 @@ export class P2PConnection {
           this.receiveMetas.delete(msg.fileId);
           this.receiveProgress.delete(msg.fileId);
           this.receiveStats.delete(msg.fileId);
+          this.receiveChunkCounts.delete(msg.fileId);
+          this.receiveFileEndReached.delete(msg.fileId);
         } else {
           // Global cancel
           for (const [id, s] of this.writableStreams.entries()) {
@@ -581,9 +612,11 @@ export class P2PConnection {
           this.receiveMetas.clear();
           this.receiveProgress.clear();
           this.receiveStats.clear();
+          this.receiveChunkCounts.clear();
+          this.receiveFileEndReached.clear();
           this.fileIdDecoderCache.clear();
           this.receiverPaused = false;
-          this.writeQueue = new ParallelTaskQueue(32);
+          this.writeQueue = new ParallelTaskQueue(16);
           this.emit('disconnected', { cancelled: true });
         }
         break;
@@ -595,22 +628,18 @@ export class P2PConnection {
     const meta = this.receiveMetas.get(fileId);
     if (!buffers || !meta) return;
 
-    const totalSize = buffers.reduce((acc, b) => acc + (b?.byteLength || 0), 0);
-    const combined = new Uint8Array(totalSize);
-    let offset = 0;
-    for (const buf of buffers) {
+    const combined = new Uint8Array(meta.size);
+    for (let i = 0; i < buffers.length; i++) {
+      const buf = buffers[i];
       if (buf) {
-        combined.set(new Uint8Array(buf), offset);
-        offset += buf.byteLength;
+        combined.set(new Uint8Array(buf), i * CHUNK_SIZE);
       }
     }
 
     const blob = new Blob([combined], { type: meta.type });
     const url = URL.createObjectURL(blob);
 
-    this.receiveBuffers.delete(fileId);
-    this.receiveProgress.delete(fileId);
-    this.receiveStats.delete(fileId);
+    this.cleanupReceiverFile(fileId);
 
     // Emit completed progress so receiver UI updates correctly
     this.emit('progress', {
@@ -654,7 +683,7 @@ export class P2PConnection {
     console.log(`[P2P] Creating offer for ${this.remotePeerId} with ${this.numChannels} channels`);
     for (let i = 0; i < this.numChannels; i++) {
       const channel = this.pc.createDataChannel(`file-transfer-${i}`, {
-        ordered: true,
+        ordered: false,
       });
       this.setupDataChannel(channel);
     }
@@ -870,7 +899,7 @@ export class P2PConnection {
     this.fileIdDecoderCache.clear(); // Clear decoder cache
     this.receiverPaused = false;
     // No direct way to "clear" ParallelTaskQueue, but resetting the instance works for cleanup
-    this.writeQueue = new ParallelTaskQueue(32); 
+    this.writeQueue = new ParallelTaskQueue(16); 
   }
 
   private async sendNextChunks() {
@@ -892,7 +921,7 @@ export class P2PConnection {
     const fillReadAhead = async () => {
       let readIndex = chunkIndex;
       while (this.isSending && readIndex < totalChunks) {
-        if (this.readAheadQueue.length >= 20) { // Keep 20 chunks (~5MB) in memory
+        if (this.readAheadQueue.length >= 40) { // Keep 40 chunks (~10MB) in memory
           await new Promise(resolve => setTimeout(resolve, 50));
           continue;
         }

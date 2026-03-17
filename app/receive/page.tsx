@@ -223,12 +223,14 @@ function ReceiveContent() {
 
   const isInRoom = !!room;
 
+  const joinAttempted = useRef(false);
   useEffect(() => {
-    if (roomFromUrl && !autoJoined && !isInRoom) {
+    if (roomFromUrl && !joinAttempted.current && !isInRoom) {
+      joinAttempted.current = true;
       setAutoJoined(true);
       joinRoom(roomFromUrl);
     }
-  }, [roomFromUrl, autoJoined, isInRoom, joinRoom]);
+  }, [roomFromUrl, isInRoom, joinRoom]);
 
   const handleJoinRoom = async (e: React.FormEvent) => {
     e.preventDefault();

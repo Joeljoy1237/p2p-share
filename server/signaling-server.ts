@@ -154,19 +154,27 @@ io.on('connection', (socket: Socket) => {
       }
 
       socket.join(room.id);
-      await redisService.addPeerToRoom(room.id, socket.id);
+      const added = await redisService.addPeerToRoom(room.id, socket.id);
+      
+      const updatedPeers = await redisService.getRoomPeers(room.id);
+      const isActuallyNew = added;
 
-      // Notify existing peers
-      socket.to(room.id).emit('peer-joined', {
-        peerId: socket.id,
-        peerCount: peerCount + 1,
-      });
+      if (isActuallyNew) {
+        // Notify existing peers only if this is a fresh join
+        socket.to(room.id).emit('peer-joined', {
+          peerId: socket.id,
+          peerCount: updatedPeers.length,
+        });
 
-      console.log(`[ROOM] ${socket.id} joined room ${room.code}`);
+        console.log(`[ROOM] ${socket.id} joined room ${room.code} (Initial)`);
+      } else {
+        console.log(`[ROOM] ${socket.id} joined room ${room.code} (Re-join/Redundant)`);
+      }
+
       callback({
         success: true,
         room: await getRoomInfo(room),
-        existingPeers,
+        existingPeers: updatedPeers.filter((id) => id !== socket.id),
       });
     } catch (error) {
       console.error(`[ROOM] Error joining room ${input}:`, error);
